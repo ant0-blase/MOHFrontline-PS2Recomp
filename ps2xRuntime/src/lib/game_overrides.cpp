@@ -21,6 +21,8 @@ extern "C"
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -965,6 +967,397 @@ namespace
         return path;
     }
 
+    // ---------------------------------------------------------------------
+    // Level identity.
+    //
+    // The override layer is reactive: it recognises paths the *game* asks for
+    // rather than choosing a level itself. So every level-specific predicate
+    // below derives its strings from whichever level the guest requested,
+    // instead of naming one. That makes all 19 shipped levels work through the
+    // same code, with no per-level branch and no level-name condition.
+    //
+    // A level is fully described by its id: "4_2" -> chapter "4", audio bank
+    // prefix "42", directory "data/4/4_2". Only membership in the shipped list
+    // is enumerated, to reject ids the disc does not have (2_4, 3_4, 6_3...).
+    // ---------------------------------------------------------------------
+
+    struct MohLevelDescriptor
+    {
+        std::string id;        // "4_2"
+        std::string chapter;   // "4"
+        std::string prefix;    // "42"
+        std::string directory; // "data/4/4_2"
+
+        bool valid() const { return !id.empty(); }
+    };
+
+    // Levels per chapter: chapter 1 has 4, chapter 2 has 3, ... chapter 6 has 2.
+    constexpr unsigned kMohLevelsPerChapter[7] = {0u, 4u, 3u, 3u, 3u, 4u, 2u};
+
+    // A level is encoded as chapter * 16 + index so it fits in one atomic word.
+    constexpr uint32_t mohLevelCode(unsigned chapter, unsigned index)
+    {
+        return (chapter << 4) | index;
+    }
+
+    bool isKnownMohLevel(unsigned chapter, unsigned index)
+    {
+        return chapter >= 1u && chapter <= 6u &&
+               index >= 1u && index <= kMohLevelsPerChapter[chapter];
+    }
+
+    // Parses "<c>_<n>" and checks it against the shipped list. Returns 0 when
+    // the text is not a level id at all, or names a level the disc lacks.
+    uint32_t mohLevelCodeFromId(std::string_view id)
+    {
+        if (id.size() != 3u || id[1] != '_')
+        {
+            return 0u;
+        }
+        if (id[0] < '1' || id[0] > '6' || id[2] < '1' || id[2] > '4')
+        {
+            return 0u;
+        }
+        const unsigned chapter = static_cast<unsigned>(id[0] - '0');
+        const unsigned index = static_cast<unsigned>(id[2] - '0');
+        return isKnownMohLevel(chapter, index) ? mohLevelCode(chapter, index) : 0u;
+    }
+
+    MohLevelDescriptor makeMohLevelDescriptor(uint32_t code)
+    {
+        MohLevelDescriptor out;
+        const unsigned chapter = (code >> 4) & 0xFu;
+        const unsigned index = code & 0xFu;
+        if (!isKnownMohLevel(chapter, index))
+        {
+            return out;
+        }
+        const char c = static_cast<char>('0' + chapter);
+        const char n = static_cast<char>('0' + index);
+        out.id = std::string{c} + "_" + n;
+        out.chapter = std::string{c};
+        out.prefix = std::string{c} + n;
+        out.directory = "data/" + out.chapter + "/" + out.id;
+        return out;
+    }
+
+    // Recovers the level from any guest path. Two shapes occur: the level
+    // directory (data/<c>/<c>_<n>/comp.viv) and bare VIV member names carrying
+    // the level id (<id>_art.cpt, <id>_c_c0.cdb, uhm<id>.dmf). The directory
+    // form is checked first because it is unambiguous; the bare form is accepted
+    // when the id names a level that actually ships.
+    uint32_t mohLevelCodeFromPath(const std::string &path)
+    {
+        const std::string norm = mohLowerAscii(normalizeMohCdPath(path));
+
+        // Directory form: data/<c>/<c>_<n>/...
+        // data/<c>/<c>_<n>/...
+        //  0123456789...
+        //  d a t a / c / c _ n /
+        //  0 1 2 3 4 5 6 7 8 9 10
+        if (norm.rfind("data/", 0) == 0 && norm.size() >= 13u &&
+            norm[6] == '/' && norm[8] == '_' && norm[10] == '/' &&
+            norm[5] == norm[7])
+        {
+            const uint32_t code = mohLevelCodeFromId(norm.substr(7, 3));
+            if (code != 0u)
+            {
+                return code;
+            }
+        }
+
+        // Bare form: any "<c>_<n>" token that names a shipped level.
+        for (std::size_t i = 0; i + 3u <= norm.size(); ++i)
+        {
+            if (norm[i + 1] != '_')
+            {
+                continue;
+            }
+            // Reject a longer number: "16_1" and "6_12" are not level ids.
+            if (i > 0 && std::isdigit(static_cast<unsigned char>(norm[i - 1])))
+            {
+                continue;
+            }
+            if (i + 3u < norm.size() &&
+                std::isdigit(static_cast<unsigned char>(norm[i + 3])))
+            {
+                continue;
+            }
+            const uint32_t code = mohLevelCodeFromId(norm.substr(i, 3));
+            if (code != 0u)
+            {
+                return code;
+            }
+        }
+        return 0u;
+    }
+
+    // The level the guest is currently loading, published when its LEVEL.VIV is
+    // recognised. Zero until then, which keeps every predicate inert during the
+    // front-end exactly as before.
+    std::atomic<uint32_t> g_mohActiveLevelCode{0u};
+
+    uint32_t mohSelectedLevelCode();
+    void mohTraceLevel(const char *fmt, ...);
+    bool mohTraceLevelLoad();
+    extern std::atomic<int> g_mohFirstArtChunk;
+    extern std::atomic<int> g_mohFirstCdbChunk;
+    bool resolveMohHostFilePath(const std::string &guestPath, std::filesystem::path &out);
+
+    // Real size of a level asset on the host, from the guest path the game asked
+    // for. The open path used to write a constant here (6_1's LEVEL.VIV size),
+    // which is why every other level stalled: the chunk loop compared that size
+    // against the real file, never matched, and rejected every materialisation.
+    // Returns 0 when the file cannot be resolved, so the caller can report the
+    // level, the requested path and the resolved path instead of inventing one.
+    uint64_t mohHostFileSize(const std::string &guestPath)
+    {
+        std::filesystem::path host;
+        if (!resolveMohHostFilePath(guestPath, host))
+        {
+            return 0u;
+        }
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(host, ec);
+        return ec ? 0u : static_cast<uint64_t>(size);
+    }
+
+    // Several guards confirm "the resident VIV object is the level VIV" by
+    // comparing a guest word against its size. That comparison used 6_1's size
+    // as a literal, so it was false for every other level and the guarded paths
+    // never ran. One helper, used everywhere, keyed on the level actually loaded.
+    MohLevelDescriptor mohActiveLevel();
+    uint32_t readGuestU32OrZero(const uint8_t *rdram, uint32_t address);
+
+    uint32_t mohActiveLevelVivSize()
+    {
+        const MohLevelDescriptor lv = mohActiveLevel();
+        if (!lv.valid())
+        {
+            return 0u;
+        }
+        const uint64_t size = mohHostFileSize(lv.directory + "/level.viv");
+        return (size == 0u || size > 0xFFFFFFFFull)
+                   ? 0u
+                   : static_cast<uint32_t>(size);
+    }
+
+    bool mohResidentLevelVivSizeMatches(const uint8_t *rdram)
+    {
+        const uint32_t expected = mohActiveLevelVivSize();
+        return expected != 0u &&
+               readGuestU32OrZero(rdram, kMohShellVivObjectSizeAddr) == expected;
+    }
+
+    // Enumerates the level's LOAD banks from the directory that actually ships,
+    // never from a hardcoded range: the count varies from 3 (5_4) to 11 (4_1,
+    // 4_2). Suffixes are ordered numerically, so LOAD2 precedes LOAD10 -- a
+    // lexicographic sort would interleave them wrongly.
+    std::vector<std::string> mohDiscoverLoadBanks(const MohLevelDescriptor &lv)
+    {
+        std::vector<std::string> banks;
+        if (!lv.valid())
+        {
+            return banks;
+        }
+
+        // Anchor on a file the level is guaranteed to have, then list its parent.
+        std::filesystem::path anchor;
+        if (!resolveMohHostFilePath(lv.directory + "/comp.viv", anchor))
+        {
+            return banks;
+        }
+
+        const std::string prefix = mohLowerAscii(lv.prefix + "load");
+        std::vector<std::pair<unsigned, std::string>> found;
+        std::error_code ec;
+        for (const auto &entry :
+             std::filesystem::directory_iterator(anchor.parent_path(), ec))
+        {
+            if (ec || !entry.is_regular_file(ec))
+            {
+                continue;
+            }
+            const std::string name = entry.path().filename().string();
+            const std::string lower = mohLowerAscii(name);
+            if (lower.rfind(prefix, 0) != 0 ||
+                lower.size() <= prefix.size() + 4u ||
+                lower.compare(lower.size() - 4u, 4u, ".abk") != 0)
+            {
+                continue;
+            }
+            const std::string digits =
+                lower.substr(prefix.size(), lower.size() - prefix.size() - 4u);
+            if (digits.empty() ||
+                digits.find_first_not_of("0123456789") != std::string::npos)
+            {
+                continue;
+            }
+            found.emplace_back(
+                static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10)),
+                name);
+        }
+
+        std::sort(found.begin(), found.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        banks.reserve(found.size());
+        for (const auto &f : found)
+        {
+            banks.push_back(f.second);
+        }
+        return banks;
+    }
+
+    void mohPublishActiveLevel(uint32_t code)
+    {
+        uint32_t previous =
+            g_mohActiveLevelCode.exchange(code, std::memory_order_acq_rel);
+        if (previous != code)
+        {
+            g_mohFirstArtChunk.store(-1, std::memory_order_release);
+            g_mohFirstCdbChunk.store(-1, std::memory_order_release);
+            const MohLevelDescriptor lv = makeMohLevelDescriptor(code);
+            mohTraceLevel(
+                "selectedLevel=%s chapter=%s prefix=%s resolvedDirectory=%s",
+                lv.id.c_str(), lv.chapter.c_str(), lv.prefix.c_str(),
+                lv.directory.c_str());
+
+            if (mohTraceLevelLoad())
+            {
+                std::filesystem::path p;
+                for (const char *leaf : {"comp.viv", "level.viv", "main.mus"})
+                {
+                    const bool ok =
+                        resolveMohHostFilePath(lv.directory + "/" + leaf, p);
+                    mohTraceLevel("  %-9s %s%s", leaf,
+                                  ok ? "OK  " : "ABSENT  ",
+                                  ok ? p.string().c_str()
+                                     : (lv.directory + "/" + leaf).c_str());
+                }
+                for (const char *bank : {"gunbnk.abk", "impbnk.abk", "movbnk.abk",
+                                         "scrbnk.abk", "strbnk.abk", "strbnk.ast",
+                                         "vehbnk.abk", "vocbnk.abk"})
+                {
+                    const std::string leaf = lv.prefix + bank;
+                    const bool ok =
+                        resolveMohHostFilePath(lv.directory + "/" + leaf, p);
+                    if (!ok)
+                    {
+                        mohTraceLevel("  banque    ABSENT  %s/%s",
+                                      lv.directory.c_str(), leaf.c_str());
+                    }
+                }
+                const std::vector<std::string> loads = mohDiscoverLoadBanks(lv);
+                std::string joined;
+                for (const std::string &b : loads)
+                {
+                    joined += (joined.empty() ? "" : " ") + b;
+                }
+                mohTraceLevel("  LOAD*.ABK n=%zu : %s", loads.size(),
+                              joined.empty() ? "(aucune)" : joined.c_str());
+            }
+        }
+    }
+
+    // Falls back to PS2_MOH_LEVEL before anything has been observed, so an
+    // explicitly selected level is already known during early loading.
+    MohLevelDescriptor mohActiveLevel()
+    {
+        uint32_t code = g_mohActiveLevelCode.load(std::memory_order_acquire);
+        if (code == 0u)
+        {
+            code = mohSelectedLevelCode();
+        }
+        return makeMohLevelDescriptor(code);
+    }
+
+    // "data/4/4_2/comp.viv" for the level currently being loaded.
+    std::string mohActiveLevelFile(const char *leaf)
+    {
+        const MohLevelDescriptor lv = mohActiveLevel();
+        return lv.valid() ? lv.directory + "/" + leaf : std::string{};
+    }
+
+    // "4_2_art.cpt" for the level currently being loaded.
+    std::string mohActiveLevelMember(const char *suffix)
+    {
+        const MohLevelDescriptor lv = mohActiveLevel();
+        return lv.valid() ? lv.id + suffix : std::string{};
+    }
+
+    // PS2_MOH_LEVEL selects a level explicitly. Unset (the default) keeps the
+    // stock behaviour: whatever the game itself picks.
+    uint32_t mohSelectedLevelCode()
+    {
+        static const uint32_t code = []() -> uint32_t
+        {
+            const char *raw = std::getenv("PS2_MOH_LEVEL");
+            if (raw == nullptr || *raw == '\0')
+            {
+                return 0u;
+            }
+            const std::string id(raw);
+            const uint32_t parsed = mohLevelCodeFromId(id);
+            if (parsed == 0u)
+            {
+                std::fprintf(stderr,
+                             "[MOH:level] PS2_MOH_LEVEL=\"%s\" refuse : identifiant "
+                             "invalide ou niveau absent du disque. Attendu "
+                             "^[1-6]_[1-4]$ parmi 1_1..1_4 2_1..2_3 3_1..3_3 "
+                             "4_1..4_3 5_1..5_4 6_1..6_2. Le jeu garde sa "
+                             "selection normale.\n",
+                             id.c_str());
+                return 0u;
+            }
+            const MohLevelDescriptor lv = makeMohLevelDescriptor(parsed);
+            std::fprintf(stderr,
+                         "[MOH:level] PS2_MOH_LEVEL=%s (chapitre %s, prefixe %s, "
+                         "repertoire %s)\n",
+                         lv.id.c_str(), lv.chapter.c_str(), lv.prefix.c_str(),
+                         lv.directory.c_str());
+            return parsed;
+        }();
+        return code;
+    }
+
+    bool mohTraceLevelLoad()
+    {
+        static const bool on = []
+        {
+            const char *v = std::getenv("PS2_MOH_TRACE_LEVEL_LOAD");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+
+    // Bounded: the trace exists to show the load sequence, not every VIV read.
+    void mohTraceLevel(const char *fmt, ...)
+    {
+        if (!mohTraceLevelLoad())
+        {
+            return;
+        }
+        static std::atomic<uint32_t> emitted{0u};
+        constexpr uint32_t kMaxLines = 400u;
+        const uint32_t n = emitted.fetch_add(1u, std::memory_order_relaxed);
+        if (n >= kMaxLines)
+        {
+            if (n == kMaxLines)
+            {
+                std::fprintf(stderr,
+                             "[MOH:level-load] (trace tronquee apres %u lignes)\n",
+                             kMaxLines);
+            }
+            return;
+        }
+        std::fprintf(stderr, "[MOH:level-load] ");
+        va_list args;
+        va_start(args, fmt);
+        std::vfprintf(stderr, fmt, args);
+        va_end(args);
+        std::fputc('\n', stderr);
+    }
+
     bool tryMohRegularFile(const std::filesystem::path &path, std::filesystem::path &out)
     {
         if (path.empty())
@@ -1224,6 +1617,161 @@ namespace
                static_cast<uint32_t>(bytes[3]);
     }
 
+    // Second container layout on this disc. Both are the same shape --
+    // [offset][size][name NUL-terminated], repeated -- but differ in field
+    // width and header:
+    //
+    //   "BIGF"  4-byte big-endian fields, count at +8, entries after 16 bytes.
+    //           5 of the 19 COMP.VIVs.
+    //   0xC0FB  3-byte big-endian fields, count as u16 at +4, entries from
+    //           offset 6. The other 14, including 6_1.
+    //
+    // resolveMohBigfMember used to reject anything not starting with "BIGF",
+    // so for those 14 archives it reported zero members and every lookup
+    // failed. Verified on all 14: entries ascending, last one ending exactly on
+    // the file size.
+    // Briefing archive of a level: "data/shell/<c>_<n>_blog.viv". Derived from
+    // the level pattern, never from a level name.
+    bool isMohLevelBlogPath(const std::string &path)
+    {
+        const std::string norm = mohLowerAscii(normalizeMohCdPath(path));
+        const uint32_t code = mohLevelCodeFromPath(norm);
+        if (code == 0u)
+        {
+            return false;
+        }
+        return norm == "data/shell/" + makeMohLevelDescriptor(code).id + "_blog.viv";
+    }
+
+    // A .ssh header declares its own size, so that format can be validated by
+    // comparing the two. A 0xC0FB container has no such field; validate the
+    // directory instead -- walk it and require the last entry to end exactly on
+    // the file size. Holds for all 17 briefing archives and all 14 COMP.VIVs.
+    bool mohPackedVivDirectoryExact(const std::filesystem::path &hostPath,
+                                    uint64_t hostSize)
+    {
+        if (hostSize < 16u || hostSize > 0xFFFFFFFFull)
+        {
+            return false;
+        }
+        const std::size_t probe =
+            static_cast<std::size_t>(std::min<uint64_t>(hostSize, 0x10000u));
+        std::vector<uint8_t> dir(probe);
+        if (!readMohHostFileRange(hostPath, 0u, dir.data(),
+                                  static_cast<uint32_t>(probe)))
+        {
+            return false;
+        }
+        if (dir.size() < 8u || dir[0] != 0xC0u || dir[1] != 0xFBu)
+        {
+            return false;
+        }
+        const uint32_t count =
+            (static_cast<uint32_t>(dir[4]) << 8u) | static_cast<uint32_t>(dir[5]);
+        if (count == 0u || count > 8192u)
+        {
+            return false;
+        }
+        std::size_t cursor = 6u;
+        uint64_t end = 0u;
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            if (cursor + 6u >= dir.size())
+            {
+                return false;
+            }
+            const uint64_t off =
+                (static_cast<uint64_t>(dir[cursor]) << 16u) |
+                (static_cast<uint64_t>(dir[cursor + 1u]) << 8u) |
+                static_cast<uint64_t>(dir[cursor + 2u]);
+            const uint64_t sz =
+                (static_cast<uint64_t>(dir[cursor + 3u]) << 16u) |
+                (static_cast<uint64_t>(dir[cursor + 4u]) << 8u) |
+                static_cast<uint64_t>(dir[cursor + 5u]);
+            cursor += 6u;
+            while (cursor < dir.size() && dir[cursor] != 0u)
+            {
+                ++cursor;
+            }
+            if (cursor >= dir.size())
+            {
+                return false;
+            }
+            ++cursor;
+            end = off + sz;
+        }
+        return end == hostSize;
+    }
+
+    bool resolveMohPackedVivMember(
+        const std::filesystem::path &archivePath,
+        uint64_t archiveFileSize,
+        const std::vector<uint8_t> &directory,
+        std::string_view requestedName,
+        MohBigfMember &out)
+    {
+        if (directory.size() < 8u)
+        {
+            return false;
+        }
+
+        const uint32_t fileCount =
+            (static_cast<uint32_t>(directory[4]) << 8u) |
+            static_cast<uint32_t>(directory[5]);
+        if (fileCount == 0u || fileCount > 8192u)
+        {
+            return false;
+        }
+
+        std::size_t cursor = 6u;
+        for (uint32_t index = 0u; index < fileCount; ++index)
+        {
+            if (cursor + 6u >= directory.size())
+            {
+                return false;
+            }
+
+            const uint64_t memberOffset =
+                (static_cast<uint64_t>(directory[cursor]) << 16u) |
+                (static_cast<uint64_t>(directory[cursor + 1u]) << 8u) |
+                static_cast<uint64_t>(directory[cursor + 2u]);
+            const uint32_t memberSize =
+                (static_cast<uint32_t>(directory[cursor + 3u]) << 16u) |
+                (static_cast<uint32_t>(directory[cursor + 4u]) << 8u) |
+                static_cast<uint32_t>(directory[cursor + 5u]);
+            cursor += 6u;
+
+            std::string memberName;
+            while (cursor < directory.size() &&
+                   directory[cursor] != 0u &&
+                   memberName.size() < 255u)
+            {
+                memberName.push_back(static_cast<char>(directory[cursor]));
+                ++cursor;
+            }
+            if (cursor >= directory.size() || directory[cursor] != 0u)
+            {
+                return false;
+            }
+            ++cursor;
+
+            if (memberOffset > archiveFileSize ||
+                memberSize > archiveFileSize - memberOffset)
+            {
+                return false;
+            }
+
+            if (equalsIgnoreCaseAscii(memberName, requestedName))
+            {
+                out.archivePath = archivePath;
+                out.offset = memberOffset;
+                out.size = memberSize;
+                return memberSize != 0u;
+            }
+        }
+        return false;
+    }
+
     bool resolveMohBigfMember(
         const std::filesystem::path &archivePath,
         std::string_view requestedName,
@@ -1258,8 +1806,191 @@ namespace
             static_cast<std::streamsize>(header.size()));
 
         if (archive.gcount() !=
-                static_cast<std::streamsize>(header.size()) ||
-            std::memcmp(
+                static_cast<std::streamsize>(header.size()))
+        {
+            return false;
+        }
+
+        // MOH C0FB container support.
+        //
+        // Format vérifié :
+        //   0x00 : C0 FB
+        //   0x04 : nombre d'entrées, u16 big-endian
+        //   0x0C : entrées consécutives
+        //          nom NUL + offset u24 BE + taille u24 BE
+        if (header[0] == 0xC0u && header[1] == 0xFBu)
+        {
+            const uint32_t fileCount =
+                (static_cast<uint32_t>(header[4]) << 8u) |
+                static_cast<uint32_t>(header[5]);
+
+            if (fileCount == 0u || fileCount > 8192u)
+            {
+                return false;
+            }
+
+            auto normalizeC0fbName =
+                [](std::string_view input)
+                {
+                    std::string result;
+                    result.reserve(input.size());
+
+                    for (char ch : input)
+                    {
+                        if (ch == '\\')
+                        {
+                            ch = '/';
+                        }
+
+                        if (ch >= 'A' && ch <= 'Z')
+                        {
+                            ch = static_cast<char>(
+                                ch - 'A' + 'a');
+                        }
+
+                        result.push_back(ch);
+                    }
+
+                    while (result.starts_with("./"))
+                    {
+                        result.erase(0u, 2u);
+                    }
+
+                    return result;
+                };
+
+            const std::string normalizedRequested =
+                normalizeC0fbName(requestedName);
+
+            const std::size_t requestedSlash =
+                normalizedRequested.find_last_of('/');
+
+            const std::string requestedBase =
+                requestedSlash == std::string::npos
+                    ? normalizedRequested
+                    : normalizedRequested.substr(
+                          requestedSlash + 1u);
+
+            uint64_t cursor = 0x0Cu;
+
+            for (uint32_t index = 0u;
+                 index < fileCount;
+                 ++index)
+            {
+                if (cursor >= archiveFileSize)
+                {
+                    return false;
+                }
+
+                archive.clear();
+                archive.seekg(
+                    static_cast<std::streamoff>(cursor),
+                    std::ios::beg);
+
+                if (!archive.good())
+                {
+                    return false;
+                }
+
+                std::string memberName;
+                memberName.reserve(64u);
+
+                bool foundTerminator = false;
+
+                for (uint32_t nameIndex = 0u;
+                     nameIndex < 512u;
+                     ++nameIndex)
+                {
+                    char ch = '\0';
+                    archive.read(&ch, 1);
+
+                    if (archive.gcount() != 1)
+                    {
+                        return false;
+                    }
+
+                    ++cursor;
+
+                    if (ch == '\0')
+                    {
+                        foundTerminator = true;
+                        break;
+                    }
+
+                    memberName.push_back(ch);
+                }
+
+                if (!foundTerminator ||
+                    memberName.empty())
+                {
+                    return false;
+                }
+
+                std::array<uint8_t, 6> metadata{};
+                archive.read(
+                    reinterpret_cast<char *>(
+                        metadata.data()),
+                    static_cast<std::streamsize>(
+                        metadata.size()));
+
+                if (archive.gcount() !=
+                    static_cast<std::streamsize>(
+                        metadata.size()))
+                {
+                    return false;
+                }
+
+                cursor += metadata.size();
+
+                const uint32_t memberOffset =
+                    (static_cast<uint32_t>(
+                         metadata[0]) << 16u) |
+                    (static_cast<uint32_t>(
+                         metadata[1]) << 8u) |
+                    static_cast<uint32_t>(
+                        metadata[2]);
+
+                const uint32_t memberSize =
+                    (static_cast<uint32_t>(
+                         metadata[3]) << 16u) |
+                    (static_cast<uint32_t>(
+                         metadata[4]) << 8u) |
+                    static_cast<uint32_t>(
+                        metadata[5]);
+
+                if (memberOffset > archiveFileSize ||
+                    memberSize >
+                        archiveFileSize - memberOffset)
+                {
+                    return false;
+                }
+
+                const std::string normalizedMember =
+                    normalizeC0fbName(memberName);
+
+                const std::size_t memberSlash =
+                    normalizedMember.find_last_of('/');
+
+                const std::string memberBase =
+                    memberSlash == std::string::npos
+                        ? normalizedMember
+                        : normalizedMember.substr(
+                              memberSlash + 1u);
+
+                if (normalizedMember ==
+                        normalizedRequested ||
+                    memberBase == requestedBase)
+                {
+                    out.offset = memberOffset;
+                    out.size = memberSize;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (std::memcmp(
                 header.data(),
                 "BIGF",
                 4u) != 0)
@@ -1374,8 +2105,14 @@ namespace
     {
         std::filesystem::path archivePath;
 
+        const MohLevelDescriptor lv = mohActiveLevel();
+        if (!lv.valid())
+        {
+            return false;
+        }
+
         return resolveMohHostFilePath(
-                   "data/6/6_1/level.viv",
+                   lv.directory + "/level.viv",
                    archivePath) &&
                resolveMohBigfMember(
                    archivePath,
@@ -2845,58 +3582,203 @@ namespace
                "levelfile.lfc";
     }
 
+    // Every predicate below answers "is this path the <thing> of *a* level?" and,
+    // when it is, the level is recovered from the path itself. Nothing names a
+    // particular level, so all 19 shipped levels take the same code path.
+    bool mohPathIsLevelFile(const std::string &path,
+                            const char *suffix,
+                            MohLevelDescriptor &lv)
+    {
+        const std::string norm = mohLowerAscii(normalizeMohCdPath(path));
+        const uint32_t code = mohLevelCodeFromPath(norm);
+        if (code == 0u)
+        {
+            return false;
+        }
+        lv = makeMohLevelDescriptor(code);
+        if (norm != lv.directory + "/" + suffix)
+        {
+            return false;
+        }
+        mohPublishActiveLevel(code);
+        return true;
+    }
+
+    // Same, for members carried inside a VIV, whose names embed the level id
+    // (<id>_art.cpt, <id>_c_c0.cdb, uhm<id>.dmf).
+    bool mohPathIsLevelMember(const std::string &path,
+                              const char *prefix,
+                              const char *suffix,
+                              MohLevelDescriptor &lv)
+    {
+        const std::string norm = mohLowerAscii(normalizeMohCdPath(path));
+        const uint32_t code = mohLevelCodeFromPath(norm);
+        if (code == 0u)
+        {
+            return false;
+        }
+        lv = makeMohLevelDescriptor(code);
+        if (norm != std::string(prefix) + lv.id + suffix)
+        {
+            return false;
+        }
+        mohPublishActiveLevel(code);
+        return true;
+    }
+
+    // Scene-construction member: "uhm<id>.dmf".
+    bool mohPathIsLevelMemberUhm(const std::string &normalized)
+    {
+        const uint32_t code = mohLevelCodeFromPath(normalized);
+        if (code == 0u)
+        {
+            return false;
+        }
+        return normalized == "uhm" + makeMohLevelDescriptor(code).id + ".dmf";
+    }
+
+    // Full path of one of the level's named audio banks, derived from the level
+    // the path itself belongs to. Returns a value that cannot match when the
+    // path names no level, so callers stay simple equality tests.
+    std::string mohLevelBankLeaf(const std::string &path, const char *leaf)
+    {
+        const uint32_t code = mohLevelCodeFromPath(path);
+        if (code == 0u)
+        {
+            return std::string{"\x01"};
+        }
+        const MohLevelDescriptor lv = makeMohLevelDescriptor(code);
+        return lv.directory + "/" + lv.prefix + leaf;
+    }
+
     bool isMohExactCompViv6_1Path(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "data/6/6_1/comp.viv";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelFile(path, "comp.viv", lv);
+    }
+
+    // COMP.VIV holds its payload as chunk members "<id>_ART_c<N>.cpt" and
+    // "<id>_C_c<N>.cdb". The indices are neither contiguous nor bounded: 6_1
+    // happens to use exactly 0..3, which is why eight fixed predicates covered
+    // it, but 1_1 uses 0 1 3 4 5 6 and 2_2 reaches 23. Parse the index instead
+    // of enumerating it.
+    //
+    // Returns the index, or -1 when the path is not a chunk member of a level.
+    int mohCompChunkIndex(const std::string &path, bool wantArt)
+    {
+        const std::string norm = mohLowerAscii(normalizeMohCdPath(path));
+        const uint32_t code = mohLevelCodeFromPath(norm);
+        if (code == 0u)
+        {
+            return -1;
+        }
+        const MohLevelDescriptor lv = makeMohLevelDescriptor(code);
+        const std::string head = lv.id + (wantArt ? "_art_c" : "_c_c");
+        const char *tail = wantArt ? ".cpt" : ".cdb";
+        const std::size_t tailLen = 4u;
+        if (norm.rfind(head, 0) != 0 ||
+            norm.size() <= head.size() + tailLen ||
+            norm.compare(norm.size() - tailLen, tailLen, tail) != 0)
+        {
+            return -1;
+        }
+        const std::string digits =
+            norm.substr(head.size(), norm.size() - head.size() - tailLen);
+        if (digits.empty() ||
+            digits.find_first_not_of("0123456789") != std::string::npos ||
+            digits.size() > 3u)
+        {
+            return -1;
+        }
+        return static_cast<int>(std::strtol(digits.c_str(), nullptr, 10));
+    }
+
+    // "A chunk member other than the first", the condition the C1/C2/C3
+    // enumerations were really expressing.
+    // Le chargeur pilote toutes ses phases depuis un morceau qu'il considere
+    // comme "le premier", ecrit en dur comme l'indice 0. Seul 6_1 satisfait cette
+    // hypothese : 7 niveaux n'ont aucun _C_c0 (le premier .cdb de 1_1 est _C_c1)
+    // et 6 n'ont aucun _ART_c0. Retenir le plus petit indice reellement observe
+    // pour le niveau courant, par type, plutot que de supposer 0.
+    std::atomic<int> g_mohFirstArtChunk{-1};
+    std::atomic<int> g_mohFirstCdbChunk{-1};
+
+    bool mohIsFirstChunkOfKind(const std::string &path, bool wantArt)
+    {
+        const int idx = mohCompChunkIndex(path, wantArt);
+        if (idx < 0)
+        {
+            return false;
+        }
+        std::atomic<int> &slot = wantArt ? g_mohFirstArtChunk : g_mohFirstCdbChunk;
+        int cur = slot.load(std::memory_order_acquire);
+        while (cur < 0 || idx < cur)
+        {
+            if (slot.compare_exchange_weak(cur, idx, std::memory_order_acq_rel))
+            {
+                cur = idx;
+                break;
+            }
+        }
+        return idx == slot.load(std::memory_order_acquire);
+    }
+
+    bool isMohCompTrailingArtChunk(const std::string &path)
+    {
+        return mohCompChunkIndex(path, true) >= 1;
+    }
+
+    bool isMohCompTrailingCdbChunk(const std::string &path)
+    {
+        return mohCompChunkIndex(path, false) >= 1;
     }
 
     bool isMohExactCompC0ArtPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_art_c0.cpt";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_art_c0.cpt", lv);
     }
 
     bool isMohExactCompC1ArtPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_art_c1.cpt";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_art_c1.cpt", lv);
     }
 
     bool isMohExactCompC2ArtPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_art_c2.cpt";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_art_c2.cpt", lv);
     }
 
     bool isMohExactCompC3ArtPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_art_c3.cpt";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_art_c3.cpt", lv);
     }
 
     bool isMohExactCompC0CdbPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_c_c0.cdb";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_c_c0.cdb", lv);
     }
 
     bool isMohExactCompC1CdbPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_c_c1.cdb";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_c_c1.cdb", lv);
     }
 
     bool isMohExactCompC2CdbPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_c_c2.cdb";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_c_c2.cdb", lv);
     }
 
     bool isMohExactCompC3CdbPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_c_c3.cdb";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_c_c3.cdb", lv);
     }
 
     void logMohCompC0CdbOpenProtocolTraceV1(
@@ -3088,29 +3970,27 @@ namespace
 
     bool isMohExactLevelViv6_1Path(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "data/6/6_1/level.viv";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelFile(path, "level.viv", lv);
     }
 
     bool isMohExactLevelViv6_1DataMemberPath(const std::string &path)
     {
-        const std::string normalized =
-            mohLowerAscii(normalizeMohCdPath(path));
-
-        return normalized == "6_1_art.cpt" ||
-               normalized == "6_1_c.cdb";
+        MohLevelDescriptor lvd;
+        return mohPathIsLevelMember(path, "", "_art.cpt", lvd) ||
+               mohPathIsLevelMember(path, "", "_c.cdb", lvd);
     }
 
     bool isMohExactLevelViv6_1ArtPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_art.cpt";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_art.cpt", lv);
     }
 
     bool isMohExactLevelViv6_1CdbPath(const std::string &path)
     {
-        return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "6_1_c.cdb";
+        MohLevelDescriptor lv;
+        return mohPathIsLevelMember(path, "", "_c.cdb", lv);
     }
 
     bool isMohExactLevelViv6_1SceneConstructionPath(const std::string &path)
@@ -3121,25 +4001,25 @@ namespace
         return normalized == "bm01.dmf" ||
                normalized == "bm36.dmf" ||
                normalized == "soldier.skl" ||
-               normalized == "uhm6_1.dmf";
+               mohPathIsLevelMemberUhm(normalized);
     }
 
     bool isMohExactLevel6_1MovBankPath(const std::string &path)
     {
         return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "data/6/6_1/61movbnk.abk";
+               mohLevelBankLeaf(path, "movbnk.abk");
     }
 
     bool isMohExactLevel6_1GunBankPath(const std::string &path)
     {
         return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "data/6/6_1/61gunbnk.abk";
+               mohLevelBankLeaf(path, "gunbnk.abk");
     }
 
     bool isMohExactLevel6_1ImpBankPath(const std::string &path)
     {
         return mohLowerAscii(normalizeMohCdPath(path)) ==
-               "data/6/6_1/61impbnk.abk";
+               mohLevelBankLeaf(path, "impbnk.abk");
     }
 
     // Any 61*.abk audio bank inside the active level directory. Proven on
@@ -3150,12 +4030,16 @@ namespace
     {
         const std::string normalized =
             mohLowerAscii(normalizeMohCdPath(path));
-        constexpr const char kPrefix[] = "data/6/6_1/61";
+        const uint32_t code = mohLevelCodeFromPath(normalized);
+        if (code == 0u)
+        {
+            return false;
+        }
+        const MohLevelDescriptor lv = makeMohLevelDescriptor(code);
+        const std::string prefix = lv.directory + "/" + lv.prefix;
         constexpr const char kSuffix[] = ".abk";
-        return normalized.size() >
-                   sizeof(kPrefix) - 1u + sizeof(kSuffix) - 1u &&
-               normalized.compare(
-                   0u, sizeof(kPrefix) - 1u, kPrefix) == 0 &&
+        return normalized.size() > prefix.size() + sizeof(kSuffix) - 1u &&
+               normalized.compare(0u, prefix.size(), prefix) == 0 &&
                normalized.compare(
                    normalized.size() - (sizeof(kSuffix) - 1u),
                    sizeof(kSuffix) - 1u, kSuffix) == 0;
@@ -3483,9 +4367,7 @@ namespace
             containsAsciiInsensitive(
                 slotPath,
                 "level.viv") &&
-            containsAsciiInsensitive(
-                slotPath,
-                "6_1");
+            mohLevelCodeFromPath(slotPath) != 0u;
 
         const uint32_t frameHandle =
             context != 0u
@@ -3743,15 +4625,38 @@ namespace
                         levelVivHeader.data() + 4u);
             }
 
-            const bool headerExact =
+            // Two container variants ship on this disc, and the check below used
+            // to accept only the first, which is why 14 of the 19 levels never
+            // materialised a single chunk.
+            //
+            //   "BIGF"  : +4 holds the archive's on-disk size, so it can be
+            //             range-checked against the file. 5 levels.
+            //   0xC0FB  : +4 holds the *uncompressed* total instead -- the
+            //             directory stays plain text while members are packed
+            //             individually and unpacked by the game. That value is
+            //             legitimately larger than the file (1_1: 24 051 748
+            //             declared for 14 336 752 on disk), so range-checking it
+            //             is meaningless. 14 levels.
+            //
+            // Dispatch on the signature, never on the level name.
+            const bool bigfContainer =
                 headerRead &&
                 levelVivHeader[0] == 'B' &&
                 levelVivHeader[1] == 'I' &&
                 levelVivHeader[2] == 'G' &&
-                levelVivHeader[3] == 'F' &&
-                levelVivArchiveSize >=
-                    levelVivHeader.size() &&
-                levelVivArchiveSize <= levelVivHostSize;
+                levelVivHeader[3] == 'F';
+            const bool packedContainer =
+                headerRead &&
+                levelVivHeader[0] == 0xC0u &&
+                levelVivHeader[1] == 0xFBu;
+
+            const bool headerExact =
+                headerRead &&
+                ((bigfContainer &&
+                  levelVivArchiveSize >=
+                      levelVivHeader.size() &&
+                  levelVivArchiveSize <= levelVivHostSize) ||
+                 packedContainer);
             const bool rangeExact =
                 headerExact &&
                 contextOffset <= levelVivHostSize &&
@@ -3872,6 +4777,143 @@ namespace
                     << " exact="
                     << (levelVivChunkExact ? 1 : 0)
                     << " copied=" << (copied ? 1 : 0)
+                    << std::endl;
+            }
+
+            if (!copied)
+            {
+                return false;
+            }
+        }
+
+        // MOH_LEVEL_BLOG_VIV_ASYNC_MATERIALIZE_V1
+        //
+        // The generic frontend async path previously reported BLOG.VIV chunks
+        // as completed without copying them. The callback therefore advanced
+        // through the archive while the destination remained zero-filled.
+        //
+        // Materialise only an exact, validated level briefing archive.
+        const bool levelBlogChunk =
+            isMohLevelBlogPath(slotPath);
+
+        if (levelBlogChunk)
+        {
+            std::filesystem::path blogHostPath;
+
+            const bool hostResolved =
+                resolveMohHostFilePath(
+                    slotPath,
+                    blogHostPath);
+
+            std::error_code sizeError;
+
+            const uint64_t hostSize64 =
+                hostResolved
+                    ? static_cast<uint64_t>(
+                          std::filesystem::file_size(
+                              blogHostPath,
+                              sizeError))
+                    : 0u;
+
+            const bool hostSizeValid =
+                hostResolved &&
+                !sizeError &&
+                hostSize64 >= 8u &&
+                hostSize64 <= PS2_RAM_SIZE;
+
+            const uint32_t hostSize =
+                hostSizeValid
+                    ? static_cast<uint32_t>(
+                          hostSize64)
+                    : 0u;
+
+            uint32_t dstOffset = 0u;
+            bool dstScratch = false;
+
+            const bool destinationExact =
+                ps2ResolveGuestPointer(
+                    dst,
+                    dstOffset,
+                    dstScratch) &&
+                !dstScratch &&
+                dstOffset < PS2_RAM_SIZE &&
+                chunk <= PS2_RAM_SIZE - dstOffset;
+
+            const bool blogChunkExact =
+                hostSizeValid &&
+                mohPackedVivDirectoryExact(
+                    blogHostPath,
+                    hostSize64) &&
+                info.entryHandle == handle &&
+                info.callback ==
+                    kMohFrontendAsyncCallbackAddr &&
+                operation == 0x63u &&
+                fileObject != 0u &&
+                fileObject == entrySlot &&
+                slotState == 1u &&
+                slotSize == hostSize &&
+                contextOffset <= hostSize &&
+                remaining ==
+                    hostSize - contextOffset &&
+                chunk <= remaining &&
+                entryOffset == contextOffset &&
+                entryChunk == chunk &&
+                entryDst == dst &&
+                destinationExact;
+
+            uint8_t *dstPtr =
+                blogChunkExact
+                    ? getMemPtr(rdram, dst)
+                    : nullptr;
+
+            const bool copied =
+                dstPtr != nullptr &&
+                readMohHostFileRange(
+                    blogHostPath,
+                    contextOffset,
+                    dstPtr,
+                    chunk);
+
+            static std::atomic<uint32_t>
+                sBlogChunkLogs{0u};
+
+            const uint32_t logIndex =
+                sBlogChunkLogs.fetch_add(
+                    1u,
+                    std::memory_order_relaxed);
+
+            if (logIndex < 64u)
+            {
+                std::cerr
+                    << (copied
+                            ? "[MOH:blog-viv-chunk-materialize-v1]"
+                            : "[MOH:blog-viv-chunk-materialize-reject-v1]")
+                    << " idx=" << std::dec << logIndex
+                    << " handle=0x" << std::hex << handle
+                    << " entry=0x" << info.entryAddr
+                    << " operation=0x" << operation
+                    << " context=0x" << info.context
+                    << " offset=0x" << contextOffset
+                    << " entryOffset=0x" << entryOffset
+                    << " chunk=0x" << chunk
+                    << " entryChunk=0x" << entryChunk
+                    << " remaining=0x" << remaining
+                    << " dst=0x" << dst
+                    << " entryDst=0x" << entryDst
+                    << " slot=0x" << fileObject
+                    << " entrySlot=0x" << entrySlot
+                    << " slotState=0x" << slotState
+                    << " slotSize=0x" << slotSize
+                    << " hostSize=0x" << hostSize
+                    << " callback=0x" << info.callback
+                    << " path='" << slotPath << "'"
+                    << " host='" << blogHostPath.string()
+                    << "'"
+                    << std::dec
+                    << " exact="
+                    << (blogChunkExact ? 1 : 0)
+                    << " copied="
+                    << (copied ? 1 : 0)
                     << std::endl;
             }
 
@@ -4013,9 +5055,10 @@ namespace
             containsAsciiInsensitive(
                 slotPath,
                 "level.viv") &&
-            containsAsciiInsensitive(
-                slotPath,
-                "6_1");
+            mohLevelCodeFromPath(slotPath) != 0u;
+
+        const bool levelBlogEntry =
+            isMohLevelBlogPath(slotPath);
 
         const bool prepared =
             prepareMohFrontendAsyncResult(
@@ -4026,7 +5069,8 @@ namespace
         // Pour shell.viv, conserver le comportement historique.
         // Pour level.viv, ne jamais publier status=1 sans avoir
         // réellement préparé/copié le chunk correspondant.
-        if (levelVivEntry &&
+        if ((levelVivEntry ||
+             levelBlogEntry) &&
             !prepared)
         {
             static uint32_t prepareRejectLogs = 0u;
@@ -4530,6 +5574,37 @@ namespace
         }
 
         return lbn == 0x407u && size >= 0x200000u;
+    }
+
+    // Tracer on the level-path builder. sub_00109F48(handle, name, flag) is the
+    // single caller of the "cd:data\%d\%d_%d\%s" template at 0x31C5A8, and is
+    // itself called only from FUN_0013b540(name, flag). Logging the name string
+    // it receives settles whether the level id is already baked into that string
+    // -- in which case the selection happens further up -- or whether the two
+    // integers are expanded here. Off unless PS2_MOH_TRACE_LEVEL_LOAD=1.
+    PS2Runtime::RecompiledFunction g_mohOriginalSub109f48 = nullptr;
+
+    void mohSub109f48LevelPathTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx && mohTraceLevelLoad())
+        {
+            static std::atomic<uint32_t> seen{0u};
+            const uint32_t n = seen.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 40u)
+            {
+                const std::string name =
+                    readGuestStringLimited(rdram, getRegU32(ctx, 5), 96u);
+                mohTraceLevel("sub_00109F48 #%u handle=0x%08x name='%s' flag=0x%08x ra=0x%08x",
+                              n, getRegU32(ctx, 4), name.c_str(),
+                              getRegU32(ctx, 6), getRegU32(ctx, 31));
+            }
+        }
+
+        if (g_mohOriginalSub109f48 &&
+            g_mohOriginalSub109f48 != &mohSub109f48LevelPathTrace)
+        {
+            g_mohOriginalSub109f48(rdram, ctx, runtime);
+        }
     }
 
     void mohSub1f2a68DirectoryGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -7942,7 +9017,7 @@ namespace
         const bool hostResolved =
             isMohExactCompC0ArtPath(path) &&
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath);
         std::error_code hostSizeError;
         const uint64_t hostSize =
@@ -8558,7 +9633,7 @@ namespace
         const bool memberResolved =
             isMohExactLevelViv6_1ArtPath(path) &&
             resolveMohLevelViv6_1Member(
-                "6_1_art.cpt",
+                mohActiveLevelMember("_art.cpt"),
                 member);
         std::error_code archiveError;
         const uint64_t archiveSize =
@@ -13025,7 +14100,8 @@ namespace
                     128u);
             const bool exactSlot =
                 slotState == 1u &&
-                isMohLoadingSshPath(slotPath) &&
+                (isMohLoadingSshPath(slotPath) ||
+                 isMohLevelBlogPath(slotPath)) &&
                 sameMohLoadingSshPath(
                     path,
                     slotPath);
@@ -13085,10 +14161,17 @@ namespace
                     ? static_cast<uint32_t>(hostSize64)
                     : 0u;
 
+            // The briefing archives never had their slot size filled at open,
+            // so the guest issued a zero-byte read and the screen stayed black.
+            // 6_1 and 6_2 ship no blog at all, which is why the defect was
+            // invisible until another level was tried.
             const bool exactShps =
-                headerRead &&
-                magic == 0x53504853u &&
-                headerSize == hostSize;
+                (headerRead &&
+                 magic == 0x53504853u &&
+                 headerSize == hostSize) ||
+                (sizeValid &&
+                 isMohLevelBlogPath(slotPath) &&
+                 mohPackedVivDirectoryExact(hostPath, hostSize64));
 
             bool sizeWritten = false;
             bool ready = false;
@@ -13655,10 +14738,7 @@ namespace
             const bool levelVivActive =
                 g_mohLevelViv6_1Active.load(
                     std::memory_order_acquire) &&
-                readGuestU32OrZero(
-                    rdram,
-                    kMohShellVivObjectSizeAddr) ==
-                    0x010E6130u;
+                mohResidentLevelVivSizeMatches(rdram);
 
             MohBigfMember member{};
 
@@ -13807,7 +14887,7 @@ namespace
                 g_mohLevelViv6_1Active.load(
                     std::memory_order_acquire) &&
                 resolveMohLevelViv6_1Member(
-                    "6_1_art.cpt",
+                    mohActiveLevelMember("_art.cpt"),
                     member);
             std::error_code archiveError;
             const bool archiveRegular =
@@ -14058,7 +15138,7 @@ namespace
                 g_mohLevelViv6_1Active.load(
                     std::memory_order_acquire) &&
                 resolveMohLevelViv6_1Member(
-                    "6_1_c.cdb",
+                    mohActiveLevelMember("_c.cdb").c_str(),
                     member);
             std::error_code archiveError;
             const bool archiveRegular =
@@ -14751,10 +15831,7 @@ namespace
             isMohExactLevelFilePath(path) &&
             g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) &&
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) ==
-                0x010E6130u;
+            mohResidentLevelVivSizeMatches(rdram);
 
         if (entryCall && exactLevelFileClose)
         {
@@ -17334,7 +18411,7 @@ namespace
                 childHandle,
                 g_mohHandle9TraceChildEntry.load(
                     std::memory_order_acquire),
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
 
@@ -17359,7 +18436,7 @@ namespace
                 childHandle,
                 g_mohHandle9TraceChildEntry.load(
                     std::memory_order_acquire),
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
     }
@@ -17401,7 +18478,7 @@ namespace
                 pc,
                 callbackHandle,
                 trackedType4Entry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31),
                 getRegU32(ctx, 31),
                 true,
@@ -17420,7 +18497,7 @@ namespace
                 g_mohHandle9TraceHandle.load(
                     std::memory_order_acquire),
                 parentEntry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
 
@@ -17444,7 +18521,7 @@ namespace
                 pc,
                 callbackHandle,
                 trackedType4Entry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31),
                 getRegU32(ctx, 31),
                 true,
@@ -17463,7 +18540,7 @@ namespace
                 g_mohHandle9TraceHandle.load(
                     std::memory_order_acquire),
                 parentEntry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
     }
@@ -17483,9 +18560,7 @@ namespace
             getRegU32(ctx, 4) != 0u ||
             !g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) ||
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) != 0x010E6130u)
+            !mohResidentLevelVivSizeMatches(rdram))
         {
             return false;
         }
@@ -17577,8 +18652,8 @@ namespace
                     slotPath));
 
         const bool initialDataMember =
-            memberName == "6_1_art.cpt" ||
-            memberName == "6_1_c.cdb";
+            memberName == mohActiveLevelMember("_art.cpt") ||
+            memberName == mohActiveLevelMember("_c.cdb");
         const bool sceneConstructionMember =
             isMohExactLevelViv6_1SceneConstructionPath(memberName);
         const bool sceneConstructionSequence =
@@ -18051,7 +19126,7 @@ namespace
                 pc,
                 handle,
                 current,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 finishCallerRa,
                 finishCallerRa,
                 true,
@@ -18121,7 +19196,7 @@ namespace
                 pc,
                 handle,
                 current,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
 
@@ -18240,7 +19315,7 @@ namespace
                 pc,
                 handle,
                 current,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 finishCallerRa,
                 finishCallerRa,
                 true,
@@ -18312,7 +19387,7 @@ namespace
                 pc,
                 handle,
                 current,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
     }
@@ -18910,7 +19985,8 @@ namespace
         if (entryPc == 0x001F4270u &&
             ret != 0u &&
             (
-                isMohLoadingSshPath(path)
+                isMohLoadingSshPath(path) ||
+                isMohLevelBlogPath(path)
             ))
         {
             MohVfsHandleSnapshot sshSnap{};
@@ -18923,7 +19999,8 @@ namespace
                 sshSnap.entryWords[0] == ret &&
                 sshSnap.slotAddr != 0u &&
                 (
-                    isMohLoadingSshPath(sshSnap.path)
+                    isMohLoadingSshPath(sshSnap.path) ||
+                    isMohLevelBlogPath(sshSnap.path)
                 );
 
             std::filesystem::path hostPath;
@@ -18980,10 +20057,18 @@ namespace
                     ? static_cast<uint32_t>(hostSize64)
                     : 0u;
 
+            // A .ssh declares its own size in its header; a 0xC0FB briefing
+            // archive does not, so validate its directory instead -- the last
+            // entry must end exactly on the file size. Without this the slot
+            // stays at size 0, the guest issues a zero-byte read and the
+            // briefing screen stays black.
             const bool exactShps =
-                headerRead &&
-                magic == 0x53504853u &&
-                headerSize == hostSize;
+                (headerRead &&
+                 magic == 0x53504853u &&
+                 headerSize == hostSize) ||
+                (sizeValid &&
+                 isMohLevelBlogPath(sshSnap.path) &&
+                 mohPackedVivDirectoryExact(hostPath, hostSize64));
 
             const uint32_t oldSize =
                 snapshotValid
@@ -20385,9 +21470,6 @@ namespace
         uint32_t handle,
         uint32_t pc)
     {
-        constexpr uint32_t kLevelVivSize =
-            0x010E6130u;
-
         if (rdram == nullptr)
         {
             return false;
@@ -20484,19 +21566,46 @@ namespace
                 slot + 0x0Cu,
                 128u);
 
+        const uint32_t slotLevelCode = mohLevelCodeFromPath(slotPath);
+
         const bool exactLevelViv =
             slotState == 1u &&
             containsAsciiInsensitive(
                 slotPath,
                 "level.viv") &&
-            containsAsciiInsensitive(
-                slotPath,
-                "6_1");
+            slotLevelCode != 0u;
 
         if (!exactLevelViv)
         {
             return false;
         }
+
+        // Publish here, not only from the path predicates. This is the earliest
+        // point at which the guest has named the level VIV it is opening, and the
+        // size guards downstream resolve their expected size from the published
+        // level -- without this they compare against nothing and every guarded
+        // path stays closed.
+        mohPublishActiveLevel(slotLevelCode);
+
+        // Size of the level that was actually requested, never a constant.
+        const uint64_t hostSize = mohHostFileSize(slotPath);
+        if (hostSize == 0u || hostSize > 0xFFFFFFFFull)
+        {
+            const MohLevelDescriptor lv =
+                makeMohLevelDescriptor(mohLevelCodeFromPath(slotPath));
+            std::filesystem::path resolved;
+            const bool found = resolveMohHostFilePath(slotPath, resolved);
+            std::cerr << "[MOH:level-viv-size-unresolved]"
+                      << " level=" << (lv.valid() ? lv.id : std::string("?"))
+                      << " requested='" << slotPath << "'"
+                      << " resolved='"
+                      << (found ? resolved.string() : std::string("(aucun)"))
+                      << "' caller=completeMohLevelVivOpenWaitV2"
+                      << " pc=0x" << std::hex << pc << std::dec
+                      << std::endl;
+            return false;
+        }
+        const uint32_t kLevelVivSize = static_cast<uint32_t>(hostSize);
 
         const bool sizeWritten =
             writeGuestU32(
@@ -20677,10 +21786,7 @@ namespace
         const bool levelVivActive =
             g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) &&
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) ==
-                0x010E6130u;
+            mohResidentLevelVivSizeMatches(rdram);
 
         MohBigfMember member{};
 
@@ -20799,10 +21905,7 @@ namespace
             readySlot != 0u &&
             g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) &&
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) ==
-                0x010E6130u;
+            mohResidentLevelVivSizeMatches(rdram);
 
         MohBigfMember member{};
 
@@ -21073,9 +22176,7 @@ namespace
             readGuestU32OrZero(
                 rdram,
                 kMohShellVivObjectPtrAddr) == 0u ||
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) != 0x010E6130u ||
+            !mohResidentLevelVivSizeMatches(rdram) ||
             (handle & kMohFrontendAsyncTypeMask) !=
                 kMohPostFrontendAsyncTypeBits)
         {
@@ -24219,8 +25320,15 @@ namespace
                 kMohFrontendAsyncTypeBits &&
             previousToken <= kHandleTokenMask - 2u &&
             handleToken == previousToken + 2u;
-        const bool gunBankFinalSuffixSequence =
-            (gunBankTransaction || impBankTransaction ||
+        // Final-suffix chunk: the one whose handle token advances by +1 instead
+        // of the usual +2. This was written for the GUN bank and later extended
+        // to IMP and generic, but never to MOV -- so a MOV bank whose transfer
+        // ends on that transition had its wake rejected and the guest waited
+        // forever (seen on 3_2: mov=1, handleToken=0x2e0, previousToken=0x2df).
+        // The rule is a property of the handle-token protocol, not of which bank
+        // is being read, so it applies to MOV as well.
+        const bool bankFinalSuffixSequence =
+            (movBankTransaction || gunBankTransaction || impBankTransaction ||
              genericBankTransaction) &&
             openHandleExact &&
             (previousWakeHandle & kMohFrontendAsyncTypeMask) ==
@@ -24231,7 +25339,7 @@ namespace
             handleToken == previousToken + 1u;
         if (!firstChunk &&
             !chainedChunk &&
-            !gunBankFinalSuffixSequence)
+            !bankFinalSuffixSequence)
         {
             static std::atomic<uint32_t>
                 sAudioSequenceRejectTraceCount{0u};
@@ -24267,7 +25375,7 @@ namespace
                     << " chainedChunk="
                     << (chainedChunk ? 1 : 0)
                     << " finalSuffixSequence="
-                    << (gunBankFinalSuffixSequence ? 1 : 0)
+                    << (bankFinalSuffixSequence ? 1 : 0)
                     << " mov="
                     << (movBankTransaction ? 1 : 0)
                     << " gun="
@@ -24306,7 +25414,7 @@ namespace
             tokenDelta >= 2u &&
             (tokenDelta & 1u) == 0u;
         const bool gunBankFinalTokenDeltaExact =
-            gunBankFinalSuffixSequence &&
+            bankFinalSuffixSequence &&
             tokenDelta >= 3u &&
             (tokenDelta & 1u) != 0u;
         const bool progressTokenDeltaExact =
@@ -24364,7 +25472,7 @@ namespace
             chunkLimit == chunk &&
             offset <= slotSize &&
             chunk == slotSize - offset;
-        const bool gunBankFinalSuffixSequenceOffsetExact =
+        const bool bankFinalSuffixSequenceOffsetExact =
             gunBankFinalTokenDeltaExact &&
             tailStrideDividesOffset &&
             nominalChunkLimit != 0u &&
@@ -24377,7 +25485,7 @@ namespace
         const bool sequenceOffsetExact =
             fullSequenceOffsetExact ||
             finalTailSequenceOffsetExact ||
-            gunBankFinalSuffixSequenceOffsetExact;
+            bankFinalSuffixSequenceOffsetExact;
         if (slotDelta % kMohVfsFileSlotStride != 0u ||
             slotDelta / kMohVfsFileSlotStride >= slotCount ||
             (underlyingHandle >> 24u) != 1u ||
@@ -24464,9 +25572,26 @@ namespace
             remaining == chunk &&
             chunkLimit == chunk &&
             chunk == slotSize;
+        // MOH_LEVEL_AUDIO_STREAM_TAIL_DESCRIPTOR_V4
+        //
+        // A level audio bank can begin at a non-sector-aligned position on
+        // disc. In that case the DVD backend may split *every* logical VFS
+        // chunk, not only the final chunk, into:
+        //
+        //   - descriptorBytes: sector-aligned prefix already in destination
+        //   - descriptorTail:  suffix completed by the DVD comparator
+        //
+        // The surrounding validation remains strict: async handle sequence,
+        // context, slot, host range, descriptor fields, byte-exact prefix,
+        // pending suffix, manager state, DVD callback/comparator and semaphore.
+        const bool streamedChunkTailSequenceExact =
+            firstChunk ||
+            chainedChunk ||
+            finalTailSequenceOffsetExact ||
+            singleChunkTailSequenceOffsetExact;
+
         const bool tailDescriptorExact =
-            (finalTailSequenceOffsetExact ||
-             singleChunkTailSequenceOffsetExact) &&
+            streamedChunkTailSequenceExact &&
             descriptorCommonExact &&
             descriptorBytes != 0u &&
             descriptorBytes < chunk &&
@@ -24478,7 +25603,7 @@ namespace
                 ? descriptorDestination - destination
                 : 0u;
         const bool gunBankFinalSuffixDescriptorExact =
-            gunBankFinalSuffixSequenceOffsetExact &&
+            bankFinalSuffixSequenceOffsetExact &&
             descriptorDestination > destination &&
             gunBankCopiedPrefix < chunk &&
             (gunBankCopiedPrefix & 0x7FFu) == 0u &&
@@ -24506,8 +25631,22 @@ namespace
         // Shape is the full-descriptor shape with chunk smaller than one
         // sector; the payload must be byte-exact in staging instead of
         // at the destination, with the DVD manager in phase 3.
+        // MOH_LEVEL_AUDIO_STAGED_FINAL_SUBSECTOR_V6
+        //
+        // Historical name retained to minimize the patch surface. This
+        // descriptor shape is also used by the final sub-sector fragment of
+        // a multi-chunk ABK, not only by a bank that fits in one chunk.
+        //
+        // Proven example:
+        //   41VehBnk.abk size=0x30780
+        //   final offset=0x30000, chunk=0x780
+        //   dvdFlags=3, descriptorBytes=0x780, sectors=1
+        //
+        // In that state the complete fragment is in the DVD staging buffer
+        // and the guest comparator copies it to destination after the sema.
         const bool stagedSingleChunkDescriptorExact =
-            singleChunkTailSequenceOffsetExact &&
+            (singleChunkTailSequenceOffsetExact ||
+             finalTailSequenceOffsetExact) &&
             fullDescriptorExact &&
             chunk < 0x800u &&
             descriptorAlignment == 0u &&
@@ -24906,7 +26045,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -25168,7 +26307,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -25489,7 +26628,7 @@ namespace
                 handle,
                 g_mohCompC0CdbOpenEntryV1.load(
                     std::memory_order_acquire),
-                "6_1_C_c0.cdb");
+                mohActiveLevelMember("_C_c0.cdb").c_str());
         }
         traceMohBinumBumType4WaitV1(rdram, ctx, handle);
         (void)wakeMohPostSceneCharsBumFrontendReadWorkerV1(
@@ -25999,7 +27138,7 @@ namespace
                 std::error_code hostError;
                 const bool hostResolved =
                     resolveMohHostFilePath(
-                        "cd:data\\6\\6_1\\comp.viv",
+                        mohActiveLevelFile("comp.viv").c_str(),
                         hostPath) &&
                     std::filesystem::is_regular_file(
                         hostPath,
@@ -26278,7 +27417,7 @@ namespace
                 std::error_code hostError;
                 const bool hostResolved =
                     resolveMohHostFilePath(
-                        "cd:data\\6\\6_1\\comp.viv",
+                        mohActiveLevelFile("comp.viv").c_str(),
                         hostPath) &&
                     std::filesystem::is_regular_file(
                         hostPath,
@@ -26673,7 +27812,7 @@ namespace
                 std::error_code hostError;
                 const bool hostResolved =
                     resolveMohHostFilePath(
-                        "cd:data\\6\\6_1\\comp.viv",
+                        mohActiveLevelFile("comp.viv").c_str(),
                         hostPath) &&
                     std::filesystem::is_regular_file(
                         hostPath,
@@ -27007,6 +28146,427 @@ namespace
                             << " dvdIdleExact="
                             << (dvdIdleExact ? 1 : 0)
                             << " type2Idle=" << (type2Idle ? 1 : 0)
+                            << std::endl;
+                    }
+                }
+            }
+
+            // MOH_GENERIC_COMP_TYPE3_CLOSE_RESTART_V2
+            //
+            // Après la dernière lecture d'un membre COMP.VIV, le callback
+            // peut laisser managerDepth=1 avec current=null et la fermeture
+            // type 3 dans queue. Le dispatcher 1F4CF0 ne peut alors jamais
+            // promouvoir l'entrée.
+            //
+            // Ce chemin couvre tout ART_c<N>.cpt et C_c<N>.cdb. L'indice
+            // est analysé par mohCompChunkIndex(), y compris les indices
+            // élevés ou non contigus.
+            if (ctx != nullptr &&
+                pc == 0x001F3F60u &&
+                getRegU32(ctx, 31) == 0x001F2638u &&
+                entry != 0u &&
+                ((handle >> 24u) & 0xFFu) == 1u &&
+                (handle & kMohFrontendAsyncTypeMask) ==
+                    kMohPostFrontendAsyncTypeBits)
+            {
+                constexpr uint32_t kDvdManagerBase =
+                    0x0025AB10u;
+                constexpr uint32_t kCompMutex =
+                    0x0036B0A0u;
+                constexpr uint32_t kAsyncFinishCallback =
+                    0x001F5148u;
+                constexpr uint32_t kDvdComparator =
+                    0x001F2CF0u;
+
+                const int artChunk =
+                    mohCompChunkIndex(path, true);
+                const int cdbChunk =
+                    mohCompChunkIndex(path, false);
+
+                const bool compMember =
+                    (artChunk >= 0) != (cdbChunk >= 0);
+
+                const uint32_t tableNow =
+                    readGuestU32OrZero(
+                        rdram,
+                        kMohAsyncTableBaseAddr);
+
+                const uint32_t expectedEntry =
+                    tableNow != 0u
+                        ? tableNow +
+                              (((handle >> 24u) & 0xFFu) *
+                               kMohAsyncEntryStride)
+                        : 0u;
+
+                const uint32_t slotPool =
+                    readGuestU32OrZero(
+                        rdram,
+                        kMohVfsFileSlotPoolBaseAddr);
+
+                const uint32_t slotCount =
+                    readGuestU32OrZero(
+                        rdram,
+                        kMohVfsFileSlotCountAddr);
+
+                const uint32_t slotDelta =
+                    slot >= slotPool
+                        ? slot - slotPool
+                        : 0u;
+
+                const uint32_t underlying =
+                    readGuestU32OrZero(
+                        rdram,
+                        slot + 0x00u);
+
+                const uint32_t memberSize =
+                    readGuestU32OrZero(
+                        rdram,
+                        slot + 0x04u);
+
+                const uint32_t memberOffset =
+                    readGuestU32OrZero(
+                        rdram,
+                        slot + 0x08u);
+
+                const bool entryExact =
+                    compMember &&
+                    tableNow != 0u &&
+                    entry == expectedEntry &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x00u) == handle &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x04u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x08u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x0Cu) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x10u) == 0x64u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x14u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x18u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x1Cu) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x20u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x24u) == slot &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x28u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        entry + 0x2Cu) == 0u;
+
+                const bool slotExact =
+                    slot != 0u &&
+                    slotPool != 0u &&
+                    slotCount != 0u &&
+                    slot >= slotPool &&
+                    slotDelta %
+                            kMohVfsFileSlotStride ==
+                        0u &&
+                    slotDelta /
+                            kMohVfsFileSlotStride <
+                        slotCount &&
+                    underlying != 0u &&
+                    memberSize != 0u;
+
+                std::filesystem::path hostPath;
+                std::error_code hostError;
+
+                const bool hostResolved =
+                    resolveMohHostFilePath(
+                        mohActiveLevelFile(
+                            "comp.viv").c_str(),
+                        hostPath) &&
+                    std::filesystem::is_regular_file(
+                        hostPath,
+                        hostError) &&
+                    !hostError;
+
+                const uint64_t hostSize =
+                    hostResolved
+                        ? std::filesystem::file_size(
+                              hostPath,
+                              hostError)
+                        : 0u;
+
+                const bool hostRangeExact =
+                    hostResolved &&
+                    !hostError &&
+                    static_cast<uint64_t>(
+                        memberOffset) +
+                            memberSize <=
+                        hostSize;
+
+                const uint32_t managerCount =
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x0Cu);
+
+                const uint32_t managerDepth =
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x10u);
+
+                const bool managerExact =
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x00u) ==
+                        0x20u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x04u) ==
+                        0x10u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x08u) ==
+                        0xFFu &&
+                    managerCount != 0u &&
+                    managerDepth == 1u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x14u) ==
+                        0x0Fu &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x18u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x1Cu) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x20u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x24u) ==
+                        tableNow &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x28u) ==
+                        slotPool &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x2Cu) ==
+                        entry &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x30u) ==
+                        underlying &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x34u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x38u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kImpBankOpenManager + 0x3Cu) ==
+                        0u;
+
+                const bool dvdIdleExact =
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x00u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x04u) !=
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x08u) ==
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x0Cu) !=
+                        0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x10u) ==
+                        3u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x18u) ==
+                        kAsyncFinishCallback &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x1Cu) ==
+                        kDvdComparator &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kDvdManagerBase + 0x20u) ==
+                        0x100u;
+
+                const bool mutexExact =
+                    readGuestU32OrZero(
+                        rdram,
+                        kCompMutex + 0x00u) == 0x50u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kCompMutex + 0x04u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kCompMutex + 0x08u) == 0u &&
+                    readGuestU32OrZero(
+                        rdram,
+                        kCompMutex + 0x0Cu) == 0u;
+
+                bool type2Idle = true;
+
+                for (uint32_t word = 0u;
+                     word < 6u;
+                     ++word)
+                {
+                    type2Idle =
+                        type2Idle &&
+                        readGuestU32OrZero(
+                            rdram,
+                            kType2PendingRequest +
+                                word * 4u) ==
+                            0u;
+                }
+
+                const bool invariantExact =
+                    entryExact &&
+                    slotExact &&
+                    hostRangeExact &&
+                    managerExact &&
+                    dvdIdleExact &&
+                    mutexExact &&
+                    type2Idle;
+
+                const uint64_t fingerprint =
+                    (static_cast<uint64_t>(
+                         handle) << 32u) |
+                    slot;
+
+                static std::atomic<uint64_t>
+                    sLastRestartedClose{0u};
+
+                uint64_t previousFingerprint =
+                    sLastRestartedClose.load(
+                        std::memory_order_acquire);
+
+                if (invariantExact &&
+                    previousFingerprint != fingerprint &&
+                    sLastRestartedClose
+                        .compare_exchange_strong(
+                            previousFingerprint,
+                            fingerprint,
+                            std::memory_order_acq_rel))
+                {
+                    if (writeGuestU32(
+                            rdram,
+                            kImpBankOpenManager + 0x10u,
+                            0u))
+                    {
+                        setMohRegU32(ctx, 4, 0u);
+                        ctx->pc = 0x001F4CF0u;
+
+                        std::cerr
+                            << "[MOH:generic-comp-type3-close-restart-v2]"
+                            << " kind="
+                            << (artChunk >= 0
+                                    ? "ART"
+                                    : "CDB")
+                            << " chunkIndex="
+                            << (artChunk >= 0
+                                    ? artChunk
+                                    : cdbChunk)
+                            << " handle=0x"
+                            << std::hex << handle
+                            << " entry=0x" << entry
+                            << " slot=0x" << slot
+                            << " memberOffset=0x"
+                            << memberOffset
+                            << " memberSize=0x"
+                            << memberSize
+                            << " managerCount=0x"
+                            << managerCount
+                            << " depth=0x"
+                            << managerDepth
+                            << "->0x0"
+                            << " path='" << path << "'"
+                            << " redirect=0x1f4cf0"
+                            << std::dec
+                            << std::endl;
+
+                        return;
+                    }
+
+                    uint64_t expectedFingerprint =
+                        fingerprint;
+
+                    (void)sLastRestartedClose
+                        .compare_exchange_strong(
+                            expectedFingerprint,
+                            previousFingerprint,
+                            std::memory_order_acq_rel);
+                }
+                else if (!invariantExact)
+                {
+                    static std::atomic<uint32_t>
+                        sRejectCount{0u};
+
+                    const uint32_t rejectIndex =
+                        sRejectCount.fetch_add(
+                            1u,
+                            std::memory_order_relaxed);
+
+                    if (rejectIndex < 32u)
+                    {
+                        std::cerr
+                            << "[MOH:generic-comp-type3-close-reject-v2]"
+                            << " idx=" << std::dec
+                            << rejectIndex
+                            << " kind="
+                            << (artChunk >= 0
+                                    ? "ART"
+                                    : "CDB")
+                            << " chunkIndex="
+                            << (artChunk >= 0
+                                    ? artChunk
+                                    : cdbChunk)
+                            << std::hex
+                            << " handle=0x" << handle
+                            << " entry=0x" << entry
+                            << " slot=0x" << slot
+                            << " managerDepth=0x"
+                            << managerDepth
+                            << " path='" << path << "'"
+                            << std::dec
+                            << " entryExact="
+                            << (entryExact ? 1 : 0)
+                            << " slotExact="
+                            << (slotExact ? 1 : 0)
+                            << " hostRangeExact="
+                            << (hostRangeExact ? 1 : 0)
+                            << " managerExact="
+                            << (managerExact ? 1 : 0)
+                            << " dvdIdleExact="
+                            << (dvdIdleExact ? 1 : 0)
+                            << " mutexExact="
+                            << (mutexExact ? 1 : 0)
+                            << " type2Idle="
+                            << (type2Idle ? 1 : 0)
                             << std::endl;
                     }
                 }
@@ -27576,13 +29136,136 @@ namespace
 
         if (trackedLevelAudioWait)
         {
-            (void)wakeMohLevelAudioFrontendReadWorkerV1(
-                rdram,
-                ctx,
-                runtime,
-                handle,
-                trackedLevelAudioEntry,
-                trackedLevelAudioPath);
+            const bool levelAudioWakeResult =
+                wakeMohLevelAudioFrontendReadWorkerV1(
+                    rdram,
+                    ctx,
+                    runtime,
+                    handle,
+                    trackedLevelAudioEntry,
+                    trackedLevelAudioPath);
+
+            // MOH_LEVEL_AUDIO_WAKE_REJECT_DIAG_V5
+            //
+            // The normal audio wake log is globally capped and may already be
+            // exhausted by an earlier large bank. Emit one complete snapshot
+            // per rejected handle so later banks remain diagnosable.
+            if (!levelAudioWakeResult)
+            {
+                static std::atomic<uint32_t> sLastRejectedHandle{0u};
+                uint32_t previousRejectedHandle =
+                    sLastRejectedHandle.load(std::memory_order_acquire);
+
+                if (previousRejectedHandle != handle &&
+                    sLastRejectedHandle.compare_exchange_strong(
+                        previousRejectedHandle,
+                        handle,
+                        std::memory_order_acq_rel))
+                {
+                    constexpr uint32_t kAudioDiagAsyncManager =
+                        0x0025FC80u;
+                    constexpr uint32_t kAudioDiagDvdManager =
+                        0x0025AB10u;
+                    constexpr uint32_t kAudioDiagDvdDescriptor =
+                        0x0025AB34u;
+
+                    const uint32_t diagContext =
+                        readGuestU32OrZero(
+                            rdram,
+                            trackedLevelAudioEntry + 0x14u);
+                    const uint32_t diagOffset =
+                        readGuestU32OrZero(
+                            rdram,
+                            trackedLevelAudioEntry + 0x18u);
+                    const uint32_t diagChunk =
+                        readGuestU32OrZero(
+                            rdram,
+                            trackedLevelAudioEntry + 0x1Cu);
+                    const uint32_t diagDestination =
+                        readGuestU32OrZero(
+                            rdram,
+                            trackedLevelAudioEntry + 0x20u);
+
+                    const bool diagMov =
+                        isMohExactLevel6_1MovBankPath(
+                            trackedLevelAudioPath);
+                    const bool diagGun =
+                        isMohExactLevel6_1GunBankPath(
+                            trackedLevelAudioPath);
+                    const bool diagImp =
+                        isMohExactLevel6_1ImpBankPath(
+                            trackedLevelAudioPath);
+
+                    const uint32_t diagOpenHandle =
+                        diagMov
+                            ? g_mohLevelAudioOpenHandleV1.load(
+                                  std::memory_order_acquire)
+                            : (diagGun
+                                   ? g_mohLevelGunBankOpenHandleV1.load(
+                                         std::memory_order_acquire)
+                                   : (diagImp
+                                          ? g_mohLevelImpBankOpenHandleV1.load(
+                                                std::memory_order_acquire)
+                                          : g_mohLevelBankOpenHandleV1.load(
+                                                std::memory_order_acquire)));
+
+                    const uint32_t diagWakeHandle =
+                        diagMov
+                            ? g_mohLevelAudioReadWakeHandleV1.load(
+                                  std::memory_order_acquire)
+                            : (diagGun
+                                   ? g_mohLevelGunBankReadWakeHandleV1.load(
+                                         std::memory_order_acquire)
+                                   : (diagImp
+                                          ? g_mohLevelImpBankReadWakeHandleV1.load(
+                                                std::memory_order_acquire)
+                                          : g_mohLevelBankReadWakeHandleV1.load(
+                                                std::memory_order_acquire)));
+
+                    std::cerr
+                        << "[MOH:level-audio-wake-reject-diag-v5]"
+                        << " pc=0x" << std::hex
+                        << (ctx ? ctx->pc : 0u)
+                        << " ra=0x"
+                        << (ctx ? getRegU32(ctx, 31) : 0u)
+                        << " handle=0x" << handle
+                        << " openHandle=0x" << diagOpenHandle
+                        << " previousWakeHandle=0x" << diagWakeHandle
+                        << " entry=0x" << trackedLevelAudioEntry
+                        << " context=0x" << diagContext
+                        << " offset=0x" << diagOffset
+                        << " chunk=0x" << diagChunk
+                        << " destination=0x" << diagDestination
+                        << " slot=0x" << trackedLevelAudioSlot
+                        << " path='" << trackedLevelAudioPath << "'"
+                        << " entryWords=";
+                    logMohGuestWords(
+                        rdram,
+                        trackedLevelAudioEntry,
+                        12u);
+                    std::cerr << " contextWords=";
+                    logMohGuestWords(
+                        rdram,
+                        diagContext,
+                        18u);
+                    std::cerr << " managerWords=";
+                    logMohGuestWords(
+                        rdram,
+                        kAudioDiagAsyncManager,
+                        16u);
+                    std::cerr << " dvdManagerWords=";
+                    logMohGuestWords(
+                        rdram,
+                        kAudioDiagDvdManager,
+                        20u);
+                    std::cerr << " dvdDescriptorWords=";
+                    logMohGuestWords(
+                        rdram,
+                        kAudioDiagDvdDescriptor,
+                        12u);
+                    std::cerr << std::dec << std::endl;
+                }
+            }
         }
 
         if (traceHandle9Wait &&
@@ -27614,7 +29297,7 @@ namespace
                 pc,
                 handle,
                 trackedEntry9,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 g_mohHandle9TraceWaitFinalRa.load(
                     std::memory_order_acquire));
         }
@@ -27654,7 +29337,7 @@ namespace
                 pc,
                 trackedCompType4Handle,
                 trackedCompType4Entry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31),
                 g_mohHandle9TraceWaitFinalRa.load(
                     std::memory_order_acquire),
@@ -27735,7 +29418,7 @@ namespace
                 pc,
                 handle,
                 directCompEntry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 ctx ? getRegU32(ctx, 31) : 0u,
                 ctx ? getRegU32(ctx, 31) : 0u,
                 false,
@@ -27895,7 +29578,7 @@ namespace
                 pc,
                 handle,
                 trackedLevelType4Entry,
-                "cd:data\\6\\6_1\\level.viv",
+                mohActiveLevelFile("level.viv").c_str(),
                 getRegU32(ctx, 31),
                 getRegU32(ctx, 31),
                 false,
@@ -27934,10 +29617,7 @@ namespace
                 tracedCloseEntry &&
             g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) &&
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) ==
-                0x010E6130u;
+            mohResidentLevelVivSizeMatches(rdram);
 
         const uint32_t tracedStatus =
             traceLevelFileCloseWait
@@ -28106,7 +29786,7 @@ namespace
                 pc,
                 handle,
                 trackedLevelType4Entry,
-                "cd:data\\6\\6_1\\level.viv",
+                mohActiveLevelFile("level.viv").c_str(),
                 getRegU32(ctx, 31),
                 getRegU32(ctx, 31),
                 true,
@@ -28581,7 +30261,7 @@ namespace
                     handle,
                     g_mohCompC0CdbOpenEntryV1.load(
                         std::memory_order_acquire),
-                    "6_1_C_c0.cdb");
+                    mohActiveLevelMember("_C_c0.cdb").c_str());
             }
 
             if (interesting)
@@ -28620,7 +30300,7 @@ namespace
                     handle,
                     g_mohCompC0CdbOpenEntryV1.load(
                         std::memory_order_acquire),
-                    "6_1_C_c0.cdb");
+                    mohActiveLevelMember("_C_c0.cdb").c_str());
             }
 
             if (logLevelArtWait)
@@ -28730,7 +30410,7 @@ namespace
                     pc,
                     handle,
                     trackedEntry9,
-                    "cd:data\\6\\6_1\\comp.viv",
+                    mohActiveLevelFile("comp.viv").c_str(),
                     g_mohHandle9TraceWaitFinalRa.load(
                         std::memory_order_acquire));
             }
@@ -29265,9 +30945,7 @@ namespace
             entryPc != 0x001F4CF0u ||
             !g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) ||
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) != 0x010E6130u)
+            !mohResidentLevelVivSizeMatches(rdram))
         {
             return;
         }
@@ -29277,8 +30955,8 @@ namespace
                 normalizeMohCdPath(
                     candidatePath));
 
-        if (memberName != "6_1_art.cpt" &&
-            memberName != "6_1_c.cdb")
+        if (memberName != mohActiveLevelMember("_art.cpt").c_str() &&
+            memberName != mohActiveLevelMember("_c.cdb").c_str())
         {
             return;
         }
@@ -29498,10 +31176,7 @@ namespace
             isMohExactLevelFilePath(candidatePath) &&
             g_mohLevelViv6_1Active.load(
                 std::memory_order_acquire) &&
-            readGuestU32OrZero(
-                rdram,
-                kMohShellVivObjectSizeAddr) ==
-                0x010E6130u;
+            mohResidentLevelVivSizeMatches(rdram);
 
         const uint32_t candidateContext =
             readGuestU32OrZero(
@@ -29906,7 +31581,7 @@ namespace
                 entryPc,
                 candidateHandle,
                 candidateEntry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
 
@@ -30119,7 +31794,7 @@ namespace
                     rdram,
                     candidateEntry + 0x00u),
                 candidateEntry,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 getRegU32(ctx, 31));
         }
 
@@ -30583,7 +32258,7 @@ namespace
             MohBigfMember artMember{};
             const bool exactLevelArtAllocation =
                 g_mohLevelViv6_1Active.load(std::memory_order_acquire) &&
-                resolveMohLevelViv6_1Member("6_1_art.cpt", artMember) &&
+                resolveMohLevelViv6_1Member(mohActiveLevelMember("_art.cpt").c_str(), artMember) &&
                 requestedSize == artMember.size;
 
             if (exactLevelVivAllocation)
@@ -31802,7 +33477,7 @@ namespace
                     rdram,
                     node + 0x00u),
                 node,
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 outerRa);
         }
 
@@ -32176,14 +33851,17 @@ namespace
             readGuestU32OrZero(rdram, entry + 0x24u);
         const std::string path =
             readGuestStringLimited(rdram, slot + 0x0Cu, 128u);
-        const bool compC1Art = isMohExactCompC1ArtPath(path);
-        const bool compC2Art = isMohExactCompC2ArtPath(path);
-        const bool compC3Art = isMohExactCompC3ArtPath(path);
+        // Any chunk after the first, not just the three indices 6_1 happens to
+        // use. chunkIndex is kept so traces stay per-index.
+        const int artChunk = mohCompChunkIndex(path, true);
+        const bool compC1Art = artChunk == 1;
+        const bool compC2Art = artChunk == 2;
+        const bool compC3Art = artChunk >= 3;
         if (entry == 0u ||
             entry != expectedEntry ||
             (handle & kMohFrontendAsyncTypeMask) !=
                 kMohFrontendAsyncTypeBits ||
-            (!compC1Art && !compC2Art && !compC3Art))
+            artChunk < 1)
         {
             return;
         }
@@ -32223,7 +33901,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(
                 hostPath,
@@ -32500,16 +34178,19 @@ namespace
             readGuestU32OrZero(rdram, queue + 0x24u);
         const std::string path =
             readGuestStringLimited(rdram, slot + 0x0Cu, 128u);
-        const bool compC1Art = isMohExactCompC1ArtPath(path);
-        const bool compC2Art = isMohExactCompC2ArtPath(path);
-        const bool compC3Art = isMohExactCompC3ArtPath(path);
+        // Any chunk after the first, not just the three indices 6_1 happens to
+        // use. chunkIndex is kept so traces stay per-index.
+        const int artChunk = mohCompChunkIndex(path, true);
+        const bool compC1Art = artChunk == 1;
+        const bool compC2Art = artChunk == 2;
+        const bool compC3Art = artChunk >= 3;
         if (current != 0u ||
             queue == 0u ||
             queue != expectedEntry ||
             depth != 1u ||
             (handle & kMohFrontendAsyncTypeMask) !=
                 kMohFrontendAsyncTypeBits ||
-            (!compC1Art && !compC2Art && !compC3Art))
+            artChunk < 1)
         {
             return;
         }
@@ -32538,7 +34219,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -32860,7 +34541,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -33010,6 +34691,775 @@ namespace
             << " threads="
             << ps2_syscalls::mohThreadStateSnapshotForTrace()
             << std::dec << std::endl;
+    }
+
+
+    // MOH_GENERIC_COMP_ALL_CHUNKS_V1
+    //
+    // Generic COMP.VIV async recovery for every ART_c<N>.cpt / C_c<N>.cdb
+    // member. Chunk indices are parsed by mohCompChunkIndex(), so sparse and
+    // high indices (for example c23) do not need dedicated functions.
+    bool wakeMohAnyCompChunkReadWorkerV1(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        constexpr uint32_t kAsyncManagerBase = 0x0025FC80u;
+        constexpr uint32_t kDvdManagerBase = 0x0025AB10u;
+        constexpr uint32_t kDvdDescriptor = 0x0025AB34u;
+        constexpr uint32_t kType2PendingRequest = 0x0036B0B0u;
+        constexpr uint32_t kAsyncFinishCallback = 0x001F5148u;
+        constexpr uint32_t kDvdComparator = 0x001F2CF0u;
+        constexpr uint32_t kCompCallback = 0x001EF658u;
+
+        if (!rdram ||
+            !ctx ||
+            !runtime ||
+            ctx->pc != 0x001A15C8u ||
+            getRegU32(ctx, 31) != 0x0010A6ACu ||
+            !g_mohLevelViv6_1Active.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        const uint32_t table =
+            readGuestU32OrZero(rdram, kMohAsyncTableBaseAddr);
+        const uint32_t entry =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x20u);
+        const uint32_t handle =
+            readGuestU32OrZero(rdram, entry + 0x00u);
+        const uint32_t expectedEntry =
+            table != 0u && handle != 0u
+                ? table +
+                      (((handle >> 24u) & 0xFFu) *
+                       kMohAsyncEntryStride)
+                : 0u;
+        const uint32_t operation =
+            readGuestU32OrZero(rdram, entry + 0x10u);
+        const uint32_t context =
+            readGuestU32OrZero(rdram, entry + 0x14u);
+        const uint32_t offset =
+            readGuestU32OrZero(rdram, entry + 0x18u);
+        const uint32_t chunk =
+            readGuestU32OrZero(rdram, entry + 0x1Cu);
+        const uint32_t destination =
+            readGuestU32OrZero(rdram, entry + 0x20u);
+        const uint32_t slot =
+            readGuestU32OrZero(rdram, entry + 0x24u);
+        const std::string path =
+            readGuestStringLimited(rdram, slot + 0x0Cu, 128u);
+        const int artChunk = mohCompChunkIndex(path, true);
+        const int cdbChunk = mohCompChunkIndex(path, false);
+        const bool compMember =
+            (artChunk >= 0) != (cdbChunk >= 0);
+
+        const bool entryExact =
+            compMember &&
+            table != 0u &&
+            entry != 0u &&
+            entry == expectedEntry &&
+            (handle & kMohFrontendAsyncTypeMask) ==
+                kMohFrontendAsyncTypeBits &&
+            readGuestU32OrZero(rdram, entry + 0x04u) == 0u &&
+            readGuestU32OrZero(rdram, entry + 0x08u) == 0u &&
+            readGuestU32OrZero(rdram, entry + 0x0Cu) == 0u &&
+            (operation == 0x64u || operation == 0x63u) &&
+            context != 0u &&
+            chunk != 0u &&
+            chunk <= 0x8000u &&
+            destination != 0u &&
+            slot != 0u &&
+            readGuestU32OrZero(rdram, entry + 0x28u) ==
+                kCompCallback &&
+            readGuestU32OrZero(rdram, entry + 0x2Cu) == 0u;
+        if (!entryExact)
+        {
+            return false;
+        }
+
+        const uint32_t contextState =
+            readGuestU32OrZero(rdram, context + 0x00u);
+        const uint32_t fileObject =
+            readGuestU32OrZero(rdram, context + 0x04u);
+        const uint32_t phaseRelativeOffset =
+            readGuestU32OrZero(rdram, context + 0x08u);
+        const uint32_t remaining =
+            readGuestU32OrZero(rdram, context + 0x28u);
+        const uint32_t slotPool =
+            readGuestU32OrZero(rdram, kMohVfsFileSlotPoolBaseAddr);
+        const uint32_t slotCount =
+            readGuestU32OrZero(rdram, kMohVfsFileSlotCountAddr);
+        const uint32_t slotDelta =
+            slot >= slotPool ? slot - slotPool : 0u;
+        const uint32_t underlying =
+            readGuestU32OrZero(rdram, slot + 0x00u);
+        const uint32_t memberSize =
+            readGuestU32OrZero(rdram, slot + 0x04u);
+        const uint32_t memberOffset =
+            readGuestU32OrZero(rdram, slot + 0x08u);
+        const uint32_t memberRemaining =
+            offset < memberSize ? memberSize - offset : 0u;
+        const uint32_t expectedChunk =
+            std::min(
+                std::min(remaining, memberRemaining),
+                0x8000u);
+
+        const bool contextExact =
+            contextState != 0u &&
+            fileObject != 0u &&
+            readGuestU32OrZero(rdram, context + 0x1Cu) == handle &&
+            readGuestU32OrZero(rdram, context + 0x20u) == slot &&
+            readGuestU32OrZero(rdram, context + 0x24u) == offset &&
+            remaining != 0u &&
+            expectedChunk != 0u &&
+            chunk == expectedChunk &&
+            readGuestU32OrZero(rdram, context + 0x2Cu) ==
+                destination;
+
+        const bool slotExact =
+            slotPool != 0u &&
+            slotCount != 0u &&
+            slot >= slotPool &&
+            slotDelta % kMohVfsFileSlotStride == 0u &&
+            slotDelta / kMohVfsFileSlotStride < slotCount &&
+            underlying != 0u &&
+            memberSize != 0u &&
+            static_cast<uint64_t>(offset) + chunk <= memberSize;
+
+        std::filesystem::path hostPath;
+        std::error_code hostError;
+        const bool hostResolved =
+            resolveMohHostFilePath(
+                mohActiveLevelFile("comp.viv").c_str(),
+                hostPath) &&
+            std::filesystem::is_regular_file(hostPath, hostError) &&
+            !hostError;
+        const uint64_t hostSize =
+            hostResolved
+                ? std::filesystem::file_size(hostPath, hostError)
+                : 0u;
+        const uint64_t chunkHostOffset =
+            static_cast<uint64_t>(memberOffset) + offset;
+        const uint32_t destinationPhysical =
+            destination & 0x1FFFFFFFu;
+        const bool hostRangeExact =
+            slotExact &&
+            hostResolved &&
+            !hostError &&
+            static_cast<uint64_t>(memberOffset) + memberSize <=
+                hostSize &&
+            chunkHostOffset <= hostSize &&
+            chunk <= hostSize - chunkHostOffset &&
+            destinationPhysical < PS2_RAM_SIZE &&
+            chunk <= PS2_RAM_SIZE - destinationPhysical &&
+            (destination &
+             (artChunk >= 0 ? 0x3Fu : 0x0Fu)) == 0u;
+
+        const uint32_t descriptorBytes =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x00u);
+        const uint32_t descriptorTail =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x04u);
+        const uint32_t descriptorAlignment =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x08u);
+        const uint32_t descriptorLba =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x0Cu);
+        const uint32_t descriptorSectors =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x10u);
+        const uint32_t descriptorDestination =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x14u);
+        const uint32_t descriptorReadMode =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x18u);
+        const uint32_t descriptorStaging =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x1Cu);
+        const uint32_t dvdFlags =
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x00u);
+        const uint32_t semaId =
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x0Cu);
+        const uint32_t dvdStaging =
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x40u);
+
+        const bool destinationOrderExact =
+            descriptorDestination >= destination &&
+            descriptorDestination - destination < chunk;
+        const uint32_t descriptorProgress =
+            destinationOrderExact
+                ? descriptorDestination - destination
+                : chunk;
+        const uint32_t descriptorRemaining =
+            descriptorProgress < chunk
+                ? chunk - descriptorProgress
+                : 0u;
+        const uint64_t descriptorHostOffset =
+            chunkHostOffset + descriptorProgress;
+        // MOH_GENERIC_COMP_DESCRIPTOR_STREAM_V3
+        //
+        // A COMP read is not guaranteed to publish the complete aligned
+        // remainder in one DVD descriptor. CDB streams can legitimately
+        // advance one 0x800-byte sector at a time while keeping the rest in
+        // descriptorTail. Validate the descriptor actually published by the
+        // game and verify its bytes against COMP.VIV instead of predicting a
+        // single bulk-transfer size.
+        const uint32_t expectedAlignment =
+            static_cast<uint32_t>(descriptorHostOffset & 0x7FFu);
+
+        const bool descriptorBytesInRange =
+            descriptorRemaining != 0u &&
+            descriptorBytes != 0u &&
+            descriptorBytes <= descriptorRemaining;
+
+        const uint32_t expectedTail =
+            descriptorBytesInRange
+                ? descriptorRemaining - descriptorBytes
+                : 0u;
+
+        const uint32_t expectedSectors =
+            descriptorBytesInRange
+                ? (expectedAlignment +
+                   descriptorBytes +
+                   0x7FFu) >> 11u
+                : 0u;
+
+        const bool descriptorUsesStaging =
+            dvdFlags == 3u;
+
+        const bool descriptorTrailingExact =
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x20u) == 0u &&
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x24u) == 0u &&
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x28u) == 0u &&
+            readGuestU32OrZero(rdram, kDvdDescriptor + 0x2Cu) == 0u;
+
+        const bool descriptorExact =
+            destinationOrderExact &&
+            descriptorBytesInRange &&
+            descriptorTail == expectedTail &&
+            descriptorAlignment == expectedAlignment &&
+            descriptorSectors == expectedSectors &&
+            descriptorReadMode != 0u &&
+            dvdStaging != 0u &&
+            descriptorStaging == dvdStaging &&
+            descriptorTrailingExact &&
+            (dvdFlags == 2u || dvdFlags == 3u);
+
+        std::vector<uint8_t> hostBytes(
+            hostRangeExact ? chunk : 0u);
+        const bool hostRead =
+            hostRangeExact &&
+            readMohHostFileRange(
+                hostPath,
+                chunkHostOffset,
+                hostBytes.data(),
+                chunk);
+        const bool completedPrefixMatch =
+            hostRead &&
+            (descriptorProgress == 0u ||
+             std::memcmp(
+                 hostBytes.data(),
+                 rdram + destinationPhysical,
+                 descriptorProgress) == 0);
+        const uint32_t descriptorDestinationPhysical =
+            descriptorDestination & 0x1FFFFFFFu;
+        const bool destinationPayloadMatch =
+            hostRead &&
+            descriptorProgress <= chunk &&
+            descriptorBytes <= chunk - descriptorProgress &&
+            descriptorDestinationPhysical < PS2_RAM_SIZE &&
+            descriptorBytes <=
+                PS2_RAM_SIZE - descriptorDestinationPhysical &&
+            std::memcmp(
+                hostBytes.data() + descriptorProgress,
+                rdram + descriptorDestinationPhysical,
+                descriptorBytes) == 0;
+        const uint64_t stagingSource64 =
+            static_cast<uint64_t>(dvdStaging) +
+            descriptorAlignment;
+        const uint32_t stagingSourcePhysical =
+            static_cast<uint32_t>(stagingSource64) &
+            0x1FFFFFFFu;
+        const bool stagingPayloadMatch =
+            hostRead &&
+            descriptorProgress <= chunk &&
+            descriptorBytes <= chunk - descriptorProgress &&
+            stagingSource64 <= 0xFFFFFFFFull &&
+            stagingSourcePhysical < PS2_RAM_SIZE &&
+            descriptorBytes <=
+                PS2_RAM_SIZE - stagingSourcePhysical &&
+            std::memcmp(
+                hostBytes.data() + descriptorProgress,
+                rdram + stagingSourcePhysical,
+                descriptorBytes) == 0;
+        const bool payloadExact =
+            completedPrefixMatch &&
+            (descriptorUsesStaging
+                 ? stagingPayloadMatch
+                 : destinationPayloadMatch);
+
+        const uint32_t managerCount =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x0Cu);
+        const bool managerExact =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x00u) ==
+                0x20u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x04u) ==
+                0x10u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x08u) ==
+                0xFFu &&
+            managerCount != 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x10u) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x14u) ==
+                0x0Fu &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x18u) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x1Cu) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x20u) ==
+                entry &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x24u) ==
+                table &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x28u) ==
+                slotPool &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x2Cu) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x30u) ==
+                underlying;
+        const bool dvdExact =
+            (dvdFlags == 2u || dvdFlags == 3u) &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x04u) != 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x08u) == 0u &&
+            semaId != 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x10u) == 3u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x14u) != 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x18u) ==
+                kAsyncFinishCallback &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x1Cu) ==
+                kDvdComparator &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x20u) ==
+                0x100u;
+        bool type2Idle = true;
+        for (uint32_t word = 0u; word < 6u; ++word)
+        {
+            type2Idle =
+                type2Idle &&
+                readGuestU32OrZero(
+                    rdram,
+                    kType2PendingRequest + word * 4u) == 0u;
+        }
+
+        const bool invariantExact =
+            contextExact &&
+            slotExact &&
+            hostRangeExact &&
+            descriptorExact &&
+            payloadExact &&
+            managerExact &&
+            dvdExact &&
+            type2Idle;
+        const uint64_t fingerprint =
+            (static_cast<uint64_t>(handle) << 32u) ^
+            (static_cast<uint64_t>(descriptorLba) << 1u) ^
+            descriptorDestination;
+        static std::atomic<uint64_t> sLastFingerprint{0u};
+        uint64_t previousFingerprint =
+            sLastFingerprint.load(std::memory_order_acquire);
+        if (invariantExact && previousFingerprint == fingerprint)
+        {
+            return false;
+        }
+
+        uint32_t signalRet = 0u;
+        bool signaled = false;
+        if (invariantExact &&
+            sLastFingerprint.compare_exchange_strong(
+                previousFingerprint,
+                fingerprint,
+                std::memory_order_acq_rel))
+        {
+            R5900Context signalCtx{};
+            signalCtx.pc = 0x00224AD0u;
+            setGuestRegU32(&signalCtx, 4, semaId);
+            ps2_syscalls::iSignalSema(rdram, &signalCtx, runtime);
+            signalRet = getRegU32(&signalCtx, 2);
+            signaled = signalRet == semaId;
+            if (!signaled)
+            {
+                uint64_t expected = fingerprint;
+                (void)sLastFingerprint.compare_exchange_strong(
+                    expected,
+                    previousFingerprint,
+                    std::memory_order_acq_rel);
+            }
+        }
+
+        static std::atomic<uint32_t> sLogCount{0u};
+        const uint32_t logIndex =
+            sLogCount.fetch_add(1u, std::memory_order_relaxed);
+        if (logIndex < 128u && !invariantExact)
+        {
+            std::cerr
+                << "[MOH:generic-comp-read-reject-v1]"
+                << " idx=" << std::dec << logIndex
+                << " kind=" << (artChunk >= 0 ? "ART" : "CDB")
+                << " chunkIndex="
+                << (artChunk >= 0 ? artChunk : cdbChunk)
+                << std::hex
+                << " handle=0x" << handle
+                << " context=0x" << context
+                << " contextState=0x" << contextState
+                << " phaseRelativeOffset=0x" << phaseRelativeOffset
+                << " offset=0x" << offset
+                << " remaining=0x" << remaining
+                << " chunk=0x" << chunk
+                << " expectedChunk=0x" << expectedChunk
+                << " destination=0x" << destination
+                << " slot=0x" << slot
+                << " memberOffset=0x" << memberOffset
+                << " memberSize=0x" << memberSize
+                << " descriptorLba=0x" << descriptorLba
+                << " descriptorDestination=0x"
+                << descriptorDestination
+                << " dvdFlags=0x" << dvdFlags
+                << " path='" << path << "'"
+                << std::dec
+                << " contextExact=" << (contextExact ? 1 : 0)
+                << " slotExact=" << (slotExact ? 1 : 0)
+                << " hostRangeExact=" << (hostRangeExact ? 1 : 0)
+                << " descriptorExact=" << (descriptorExact ? 1 : 0)
+                << " payloadExact=" << (payloadExact ? 1 : 0)
+                << " managerExact=" << (managerExact ? 1 : 0)
+                << " dvdExact=" << (dvdExact ? 1 : 0)
+                << " type2Idle=" << (type2Idle ? 1 : 0)
+                << std::endl;
+        }
+        else if (signaled)
+        {
+            std::cerr
+                << "[MOH:generic-comp-read-wake-v1]"
+                << " kind=" << (artChunk >= 0 ? "ART" : "CDB")
+                << " chunkIndex="
+                << (artChunk >= 0 ? artChunk : cdbChunk)
+                << " handle=0x" << std::hex << handle
+                << " offset=0x" << offset
+                << " chunk=0x" << chunk
+                << " path='" << path << "'"
+                << std::dec
+                << " signaled=1"
+                << std::endl;
+        }
+
+        return signaled;
+    }
+
+    bool handoffMohAnyCompChunkQueuedReadV1(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        constexpr uint32_t kAsyncManagerBase = 0x0025FC80u;
+        constexpr uint32_t kDvdManagerBase = 0x0025AB10u;
+        constexpr uint32_t kType2PendingRequest = 0x0036B0B0u;
+        constexpr uint32_t kCompMutex = 0x0036B0A0u;
+        constexpr uint32_t kCompCallback = 0x001EF658u;
+        constexpr uint32_t kAsyncFinishCallback = 0x001F5148u;
+        constexpr uint32_t kDvdComparator = 0x001F2CF0u;
+
+        if (!rdram ||
+            !ctx ||
+            !runtime ||
+            ctx->pc != 0x001A15C8u ||
+            getRegU32(ctx, 31) != 0x0010A6ACu ||
+            !g_mohLevelViv6_1Active.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        const uint32_t table =
+            readGuestU32OrZero(rdram, kMohAsyncTableBaseAddr);
+        const uint32_t current =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x20u);
+        const uint32_t entry =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x2Cu);
+        const uint32_t depth =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x10u);
+        const uint32_t handle =
+            readGuestU32OrZero(rdram, entry + 0x00u);
+        const uint32_t expectedEntry =
+            table != 0u && handle != 0u
+                ? table +
+                      (((handle >> 24u) & 0xFFu) *
+                       kMohAsyncEntryStride)
+                : 0u;
+        const uint32_t operation =
+            readGuestU32OrZero(rdram, entry + 0x10u);
+        const uint32_t context =
+            readGuestU32OrZero(rdram, entry + 0x14u);
+        const uint32_t offset =
+            readGuestU32OrZero(rdram, entry + 0x18u);
+        const uint32_t chunk =
+            readGuestU32OrZero(rdram, entry + 0x1Cu);
+        const uint32_t destination =
+            readGuestU32OrZero(rdram, entry + 0x20u);
+        const uint32_t slot =
+            readGuestU32OrZero(rdram, entry + 0x24u);
+        const std::string path =
+            readGuestStringLimited(rdram, slot + 0x0Cu, 128u);
+        const int artChunk = mohCompChunkIndex(path, true);
+        const int cdbChunk = mohCompChunkIndex(path, false);
+        const bool compMember =
+            (artChunk >= 0) != (cdbChunk >= 0);
+
+        if (current != 0u ||
+            entry == 0u ||
+            depth != 1u ||
+            !compMember)
+        {
+            return false;
+        }
+
+        const uint32_t remaining =
+            readGuestU32OrZero(rdram, context + 0x28u);
+        const uint32_t slotPool =
+            readGuestU32OrZero(rdram, kMohVfsFileSlotPoolBaseAddr);
+        const uint32_t slotCount =
+            readGuestU32OrZero(rdram, kMohVfsFileSlotCountAddr);
+        const uint32_t slotDelta =
+            slot >= slotPool ? slot - slotPool : 0u;
+        const uint32_t underlying =
+            readGuestU32OrZero(rdram, slot + 0x00u);
+        const uint32_t memberSize =
+            readGuestU32OrZero(rdram, slot + 0x04u);
+        const uint32_t memberOffset =
+            readGuestU32OrZero(rdram, slot + 0x08u);
+        const uint32_t memberRemaining =
+            offset < memberSize ? memberSize - offset : 0u;
+        const uint32_t expectedChunk =
+            std::min(
+                std::min(remaining, memberRemaining),
+                0x8000u);
+
+        const bool entryExact =
+            table != 0u &&
+            entry == expectedEntry &&
+            (handle & kMohFrontendAsyncTypeMask) ==
+                kMohFrontendAsyncTypeBits &&
+            readGuestU32OrZero(rdram, entry + 0x04u) == 0u &&
+            readGuestU32OrZero(rdram, entry + 0x08u) == 0u &&
+            readGuestU32OrZero(rdram, entry + 0x0Cu) == 0u &&
+            (operation == 0x64u || operation == 0x63u) &&
+            context != 0u &&
+            chunk != 0u &&
+            chunk <= 0x8000u &&
+            destination != 0u &&
+            slot != 0u &&
+            readGuestU32OrZero(rdram, entry + 0x28u) ==
+                kCompCallback &&
+            readGuestU32OrZero(rdram, entry + 0x2Cu) == 0u;
+        const bool contextExact =
+            readGuestU32OrZero(rdram, context + 0x00u) != 0u &&
+            readGuestU32OrZero(rdram, context + 0x04u) != 0u &&
+            readGuestU32OrZero(rdram, context + 0x1Cu) == handle &&
+            readGuestU32OrZero(rdram, context + 0x20u) == slot &&
+            readGuestU32OrZero(rdram, context + 0x24u) == offset &&
+            remaining != 0u &&
+            expectedChunk != 0u &&
+            chunk == expectedChunk &&
+            readGuestU32OrZero(rdram, context + 0x2Cu) ==
+                destination;
+        const bool slotExact =
+            slotPool != 0u &&
+            slotCount != 0u &&
+            slot >= slotPool &&
+            slotDelta % kMohVfsFileSlotStride == 0u &&
+            slotDelta / kMohVfsFileSlotStride < slotCount &&
+            underlying != 0u &&
+            memberSize != 0u &&
+            static_cast<uint64_t>(offset) + chunk <= memberSize;
+
+        std::filesystem::path hostPath;
+        std::error_code hostError;
+        const bool hostResolved =
+            resolveMohHostFilePath(
+                mohActiveLevelFile("comp.viv").c_str(),
+                hostPath) &&
+            std::filesystem::is_regular_file(hostPath, hostError) &&
+            !hostError;
+        const uint64_t hostSize =
+            hostResolved
+                ? std::filesystem::file_size(hostPath, hostError)
+                : 0u;
+        const uint32_t destinationPhysical =
+            destination & 0x1FFFFFFFu;
+        const bool hostRangeExact =
+            hostResolved &&
+            !hostError &&
+            static_cast<uint64_t>(memberOffset) + memberSize <=
+                hostSize &&
+            destinationPhysical < PS2_RAM_SIZE &&
+            chunk <= PS2_RAM_SIZE - destinationPhysical &&
+            (destination &
+             (artChunk >= 0 ? 0x3Fu : 0x0Fu)) == 0u;
+
+        const uint32_t managerCount =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x0Cu);
+        const bool managerExact =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x00u) ==
+                0x20u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x04u) ==
+                0x10u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x08u) ==
+                0xFFu &&
+            managerCount != 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x10u) == 1u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x14u) ==
+                0x0Fu &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x18u) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x1Cu) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x20u) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x24u) ==
+                table &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x28u) ==
+                slotPool &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x2Cu) ==
+                entry &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x30u) ==
+                underlying;
+        const bool dvdIdle =
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x00u) == 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x04u) != 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x08u) == 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x0Cu) != 0u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x10u) == 3u &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x18u) ==
+                kAsyncFinishCallback &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x1Cu) ==
+                kDvdComparator &&
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x20u) ==
+                0x100u;
+        const bool mutexExact =
+            readGuestU32OrZero(rdram, kCompMutex + 0x00u) == 0x50u &&
+            readGuestU32OrZero(rdram, kCompMutex + 0x04u) == 0u &&
+            readGuestU32OrZero(rdram, kCompMutex + 0x08u) == 0u &&
+            readGuestU32OrZero(rdram, kCompMutex + 0x0Cu) == 0u;
+        bool type2Idle = true;
+        for (uint32_t word = 0u; word < 6u; ++word)
+        {
+            type2Idle =
+                type2Idle &&
+                readGuestU32OrZero(
+                    rdram,
+                    kType2PendingRequest + word * 4u) == 0u;
+        }
+
+        const bool invariantExact =
+            entryExact &&
+            contextExact &&
+            slotExact &&
+            hostRangeExact &&
+            managerExact &&
+            dvdIdle &&
+            mutexExact &&
+            type2Idle;
+        if (!invariantExact)
+        {
+            static std::atomic<uint32_t> sRejectCount{0u};
+            const uint32_t rejectIndex =
+                sRejectCount.fetch_add(1u, std::memory_order_relaxed);
+            if (rejectIndex < 64u)
+            {
+                std::cerr
+                    << "[MOH:generic-comp-handoff-reject-v1]"
+                    << " idx=" << std::dec << rejectIndex
+                    << " kind=" << (artChunk >= 0 ? "ART" : "CDB")
+                    << " chunkIndex="
+                    << (artChunk >= 0 ? artChunk : cdbChunk)
+                    << std::hex
+                    << " handle=0x" << handle
+                    << " context=0x" << context
+                    << " offset=0x" << offset
+                    << " remaining=0x" << remaining
+                    << " chunk=0x" << chunk
+                    << " expectedChunk=0x" << expectedChunk
+                    << " destination=0x" << destination
+                    << " slot=0x" << slot
+                    << " path='" << path << "'"
+                    << std::dec
+                    << " entryExact=" << (entryExact ? 1 : 0)
+                    << " contextExact=" << (contextExact ? 1 : 0)
+                    << " slotExact=" << (slotExact ? 1 : 0)
+                    << " hostRangeExact=" << (hostRangeExact ? 1 : 0)
+                    << " managerExact=" << (managerExact ? 1 : 0)
+                    << " dvdIdle=" << (dvdIdle ? 1 : 0)
+                    << " mutexExact=" << (mutexExact ? 1 : 0)
+                    << " type2Idle=" << (type2Idle ? 1 : 0)
+                    << std::endl;
+            }
+            return false;
+        }
+
+        PS2Runtime::RecompiledFunction dispatchFn =
+            runtime->lookupFunction(0x001F4CF0u);
+        if (!dispatchFn)
+        {
+            return false;
+        }
+
+        const uint64_t fingerprint =
+            (static_cast<uint64_t>(handle) << 32u) | entry;
+        static std::atomic<uint64_t> sHandledFingerprint{0u};
+        uint64_t previousFingerprint =
+            sHandledFingerprint.load(std::memory_order_acquire);
+        if (previousFingerprint == fingerprint ||
+            !sHandledFingerprint.compare_exchange_strong(
+                previousFingerprint,
+                fingerprint,
+                std::memory_order_acq_rel))
+        {
+            return false;
+        }
+
+        if (!writeGuestU32(rdram, kAsyncManagerBase + 0x10u, 0u))
+        {
+            sHandledFingerprint.store(
+                previousFingerprint,
+                std::memory_order_release);
+            return false;
+        }
+
+        R5900Context dispatchCtx = *ctx;
+        dispatchCtx.pc = 0x001F4CF0u;
+        dispatchCtx.in_delay_slot = false;
+        dispatchCtx.branch_pc = 0u;
+        setMohRegU32(&dispatchCtx, 4, 0u);
+        setMohRegU32(&dispatchCtx, 31, 0u);
+        dispatchFn(rdram, &dispatchCtx, runtime);
+
+        const uint32_t dispatchedDvdFlags =
+            readGuestU32OrZero(rdram, kDvdManagerBase + 0x00u);
+        const bool dispatchedExact =
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x10u) == 0u &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x20u) ==
+                entry &&
+            readGuestU32OrZero(rdram, kAsyncManagerBase + 0x2Cu) == 0u &&
+            (dispatchedDvdFlags == 2u || dispatchedDvdFlags == 3u);
+        if (!dispatchedExact)
+        {
+            uint64_t expected = fingerprint;
+            (void)sHandledFingerprint.compare_exchange_strong(
+                expected,
+                previousFingerprint,
+                std::memory_order_acq_rel);
+        }
+
+        std::cerr
+            << (dispatchedExact
+                    ? "[MOH:generic-comp-handoff-v1]"
+                    : "[MOH:generic-comp-handoff-failed-v1]")
+            << " kind=" << (artChunk >= 0 ? "ART" : "CDB")
+            << " chunkIndex="
+            << (artChunk >= 0 ? artChunk : cdbChunk)
+            << " handle=0x" << std::hex << handle
+            << " offset=0x" << offset
+            << " chunk=0x" << chunk
+            << " path='" << path << "'"
+            << std::dec
+            << " dispatchedExact=" << (dispatchedExact ? 1 : 0)
+            << std::endl;
+
+        return dispatchedExact;
     }
 
     bool wakeMohCompC1ReadWorkerV1(
@@ -33938,7 +36388,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(
                 hostPath,
@@ -34569,7 +37019,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -35079,7 +37529,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -35541,7 +37991,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -35751,6 +38201,17 @@ namespace
         R5900Context *ctx,
         PS2Runtime *runtime)
     {
+        // MOH_GENERIC_ART_PHASES_RUNTIME_BANNER_V1
+        static std::atomic<bool> sGenericArtPhasesBanner{false};
+        if (!sGenericArtPhasesBanner.exchange(
+                true,
+                std::memory_order_acq_rel))
+        {
+            std::cerr
+                << "[MOH:generic-art-phases-runtime-v1-active]"
+                << std::endl;
+        }
+
         constexpr uint32_t kAsyncManagerBase = 0x0025FC80u;
         constexpr uint32_t kDvdManagerBase = 0x0025AB10u;
         constexpr uint32_t kDvdDescriptor = 0x0025AB34u;
@@ -35812,57 +38273,124 @@ namespace
             readGuestU32OrZero(rdram, object + 0x04u);
         const uint32_t fileState =
             readGuestU32OrZero(rdram, object + 0x34u);
+        // MOH_COMP_C0_GENERIC_ART_PHASES_V1
+        //
+        // ART members are split by the guest into logical 0x80000-byte phases.
+        // The old compatibility path only recognised phase 1 (tag 0x100) and
+        // phase 2 (tag 0x201). Larger ART members legitimately create phase 3
+        // (tag 0x302), phase 4 (0x403), and so on. Derive every invariant from
+        // the guest's phase index instead of hard-coding one level's size.
+        const uint32_t memberSizeForContext =
+            readGuestU32OrZero(rdram, slot + 0x04u);
+        const uint32_t phaseIndex =
+            readGuestU32OrZero(rdram, object + 0x30u);
+        const uint64_t phaseCount64 =
+            memberSizeForContext != 0u
+                ? (static_cast<uint64_t>(memberSizeForContext) +
+                   0x7FFFFull) /
+                      0x80000ull
+                : 0u;
+        const bool phaseIndexExact =
+            phaseIndex >= 1u &&
+            static_cast<uint64_t>(phaseIndex) <= phaseCount64;
+        const uint64_t phaseBase64 =
+            phaseIndexExact
+                ? static_cast<uint64_t>(phaseIndex - 1u) *
+                      0x80000ull
+                : 0x100000000ull;
+        const bool phaseBaseRepresentable =
+            phaseBase64 <= 0xFFFFFFFFull;
         const uint32_t postTerminalBaseOffset =
-            readGuestU32OrZero(rdram, finalObject + 0x24u);
+            phaseBaseRepresentable
+                ? static_cast<uint32_t>(phaseBase64)
+                : 0u;
+        const uint32_t expectedPhaseTag =
+            phaseIndexExact
+                ? phaseIndex * 0x101u - 1u
+                : 0u;
+        const bool firstPhase = phaseIndex == 1u;
+        const bool laterPhase = phaseIndex > 1u;
+        const bool phaseOffsetExact =
+            phaseIndexExact &&
+            phaseBaseRepresentable &&
+            offset >= postTerminalBaseOffset &&
+            offset - postTerminalBaseOffset < 0x80000u &&
+            (offset - postTerminalBaseOffset) % 0x8000u == 0u;
+        const uint32_t phaseRelativeOffset =
+            phaseOffsetExact
+                ? offset - postTerminalBaseOffset
+                : 0u;
         const uint32_t postTerminalSpan =
             readGuestU32OrZero(rdram, finalObject + 0x08u);
+        const uint32_t postTerminalMemberRemaining =
+            offset < memberSizeForContext
+                ? memberSizeForContext - offset
+                : 0u;
+        const uint32_t postTerminalChunkLimit =
+            std::min(postTerminalMemberRemaining, 0x8000u);
+        const bool currentPhaseObjectExact =
+            phaseOffsetExact &&
+            expectedPhaseTag != 0u &&
+            readGuestU32OrZero(rdram, object + 0x00u) ==
+                expectedPhaseTag &&
+            fileObject != 0u &&
+            readGuestU32OrZero(rdram, object + 0x08u) ==
+                phaseRelativeOffset &&
+            readGuestU32OrZero(rdram, object + 0x1Cu) == handle &&
+            readGuestU32OrZero(rdram, object + 0x20u) == slot &&
+            readGuestU32OrZero(rdram, object + 0x24u) == offset &&
+            remaining != 0u &&
+            static_cast<uint64_t>(phaseRelativeOffset) + remaining ==
+                0x80000ull &&
+            postTerminalChunkLimit != 0u &&
+            chunk == std::min(remaining, postTerminalChunkLimit) &&
+            readGuestU32OrZero(rdram, object + 0x2Cu) ==
+                destination &&
+            readGuestU32OrZero(rdram, object + 0x30u) ==
+                phaseIndex &&
+            fileState != 0u &&
+            readGuestU32OrZero(rdram, fileObject + 0x00u) ==
+                phaseIndex &&
+            readGuestU32OrZero(rdram, fileObject + 0x04u) ==
+                fileState &&
+            operation ==
+                (phaseRelativeOffset == 0u ? 0x64u : 0x63u);
+        // Previous phase objects are recycled by the guest and their header
+        // is not stable after phase 2. The stable provenance is the final handle
+        // sequence plus the fully validated current object/entry/slot/DVD state.
         const bool postTerminalObjectExact =
+            laterPhase &&
             finalObject != 0u &&
             finalDataHandle != 0u &&
             object != 0u &&
             object != finalObject &&
-            readGuestU32OrZero(rdram, finalObject + 0x00u) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x04u) == 0u &&
-            postTerminalSpan != 0u &&
-            postTerminalBaseOffset == postTerminalSpan &&
-            readGuestU32OrZero(rdram, finalObject + 0x0Cu) == 1u &&
-            readGuestU32OrZero(rdram, finalObject + 0x1Cu) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x20u) == slot &&
-            readGuestU32OrZero(rdram, finalObject + 0x28u) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x30u) == 0x201u &&
-            readGuestU32OrZero(rdram, finalObject + 0x34u) == fileObject &&
-            readGuestU32OrZero(rdram, object + 0x00u) == 0x201u &&
-            fileObject != 0u;
+            currentPhaseObjectExact;
         const bool postTerminalOffsetExact =
-            postTerminalObjectExact &&
-            offset >= postTerminalBaseOffset &&
-            (offset - postTerminalBaseOffset) % 0x8000u == 0u;
-        const uint32_t phaseRelativeOffset =
-            postTerminalOffsetExact
-                ? offset - postTerminalBaseOffset
-                : offset;
-        const uint32_t chunkOrdinal = phaseRelativeOffset / 0x8000u;
+            laterPhase && phaseOffsetExact;
+        const uint32_t chunkOrdinal =
+            phaseRelativeOffset / 0x8000u;
         const uint64_t expectedToken =
             static_cast<uint64_t>(initialHandle & 0x000FFFFFu) +
             chunkOrdinal;
         const uint64_t expectedPostTerminalToken =
             static_cast<uint64_t>(finalDataHandle & 0x000FFFFFu) +
-            2u +
-            chunkOrdinal;
+            2u + chunkOrdinal;
         const bool firstHandleExact =
+            firstPhase &&
             initialHandle == 0u &&
             offset == 0u &&
             handle == tracedHandle;
         const bool chainedHandleExact =
+            firstPhase &&
             initialHandle != 0u &&
-            offset % 0x8000u == 0u &&
+            phaseOffsetExact &&
             (handle & 0xFFF00000u) ==
                 (initialHandle & 0xFFF00000u) &&
             expectedToken <= 0x000FFFFFu &&
             (handle & 0x000FFFFFu) ==
                 static_cast<uint32_t>(expectedToken);
         const bool postTerminalHandleExact =
-            postTerminalOffsetExact &&
+            postTerminalObjectExact &&
             (finalDataHandle & kMohFrontendAsyncTypeMask) ==
                 kMohFrontendAsyncTypeBits &&
             (handle & 0xFFF00000u) ==
@@ -35903,50 +38431,12 @@ namespace
             return false;
         }
 
-        const uint32_t memberSizeForContext =
-            readGuestU32OrZero(rdram, slot + 0x04u);
-        const uint32_t postTerminalMemberRemaining =
-            offset < memberSizeForContext
-                ? memberSizeForContext - offset
-                : 0u;
-        const uint32_t postTerminalChunkLimit =
-            std::min(postTerminalMemberRemaining, 0x8000u);
         const bool firstContextExact =
-            !postTerminalHandleExact &&
-            readGuestU32OrZero(rdram, object + 0x00u) == 0x100u &&
-            fileObject != 0u &&
-            readGuestU32OrZero(rdram, object + 0x08u) == offset &&
-            readGuestU32OrZero(rdram, object + 0x1Cu) == handle &&
-            readGuestU32OrZero(rdram, object + 0x20u) == slot &&
-            readGuestU32OrZero(rdram, object + 0x24u) == offset &&
-            remaining != 0u &&
-            chunk == std::min(remaining, 0x8000u) &&
-            readGuestU32OrZero(rdram, object + 0x2Cu) == destination &&
-            readGuestU32OrZero(rdram, object + 0x30u) == 1u &&
-            fileState != 0u &&
-            readGuestU32OrZero(rdram, fileObject + 0x00u) == 1u &&
-            readGuestU32OrZero(rdram, fileObject + 0x04u) == fileState &&
-            operation == (offset == 0u ? 0x64u : 0x63u);
+            firstPhase && currentPhaseObjectExact;
         const bool postTerminalContextExact =
+            laterPhase &&
             postTerminalHandleExact &&
-            readGuestU32OrZero(rdram, object + 0x08u) ==
-                phaseRelativeOffset &&
-            readGuestU32OrZero(rdram, object + 0x1Cu) == handle &&
-            readGuestU32OrZero(rdram, object + 0x20u) == slot &&
-            readGuestU32OrZero(rdram, object + 0x24u) == offset &&
-            remaining != 0u &&
-            static_cast<uint64_t>(phaseRelativeOffset) + remaining ==
-                postTerminalSpan &&
-            postTerminalChunkLimit != 0u &&
-            chunk ==
-                std::min(remaining, postTerminalChunkLimit) &&
-            readGuestU32OrZero(rdram, object + 0x2Cu) == destination &&
-            readGuestU32OrZero(rdram, object + 0x30u) == 2u &&
-            fileState != 0u &&
-            readGuestU32OrZero(rdram, fileObject + 0x00u) == 2u &&
-            readGuestU32OrZero(rdram, fileObject + 0x04u) == fileState &&
-            operation ==
-                (phaseRelativeOffset == 0u ? 0x64u : 0x63u);
+            currentPhaseObjectExact;
         const bool contextExact =
             firstContextExact || postTerminalContextExact;
 
@@ -35970,8 +38460,16 @@ namespace
             slotDelta / kMohVfsFileSlotStride < slotCount &&
             underlying != 0u &&
             memberSize != 0u &&
+            // `remaining` is the loader's phase span (0x80000), not the number
+            // of bytes this member still owes. Requiring the whole phase to fit
+            // inside the member only holds when the member is larger than the
+            // phase -- true of 6_1's first ART chunk (0xaf7b0) and false as soon
+            // as a member is smaller (3_2: 0x59d48), which rejected every wake
+            // and stalled the loader. The transfer itself stays bounded by the
+            // per-chunk check just below, so require only that the read starts
+            // inside the member.
             (postTerminalHandleExact ||
-             static_cast<uint64_t>(offset) + remaining <= memberSize) &&
+             static_cast<uint64_t>(offset) < memberSize) &&
             static_cast<uint64_t>(offset) + chunk <= memberSize &&
             isMohExactCompC0ArtPath(path);
 
@@ -35979,7 +38477,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -36019,6 +38517,43 @@ namespace
                     hostBaseLba = file.baseLbn;
                     cdFileExact = hostBaseLba != 0u;
                     break;
+                }
+            }
+
+            // cdFileExact gates expectedLba, which gates descriptorExact,
+            // payloadExact, managerExact and dvdExact -- i.e. the whole
+            // invariant that decides whether the DVD-completion semaphore is
+            // signalled. When it fails the guest waits forever, so report which
+            // of the three conditions was not met rather than leaving a silent 0.
+            if (!cdFileExact && mohTraceLevelLoad())
+            {
+                static std::atomic<uint32_t> reported{0u};
+                if (reported.fetch_add(1u, std::memory_order_relaxed) < 4u)
+                {
+                    std::cerr << "[MOH:cd-file-inexact] cherche='"
+                              << normalizedHost.string() << "' taille=" << hostSize
+                              << " parmi " << cdSnapshot.files.size() << " entrees\n";
+                    for (const ps2_stubs::CdDebugFileEntry &file : cdSnapshot.files)
+                    {
+                        const bool samePath =
+                            file.hostPath.lexically_normal() == normalizedHost;
+                        const bool sameLeaf =
+                            file.hostPath.filename() == normalizedHost.filename();
+                        if (!samePath && !sameLeaf)
+                        {
+                            continue;
+                        }
+                        std::cerr << "  candidat '" << file.hostPath.string()
+                                  << "' cheminEgal=" << (samePath ? 1 : 0)
+                                  << " taille=" << file.sizeBytes
+                                  << " tailleEgale="
+                                  << (static_cast<uint64_t>(file.sizeBytes) == hostSize ? 1 : 0)
+                                  << " secteurs=" << file.sectors
+                                  << " secteursCoherents="
+                                  << (file.sectors == (file.sizeBytes + 0x7FFu) / 0x800u ? 1 : 0)
+                                  << " baseLbn=0x" << std::hex << file.baseLbn << std::dec
+                                  << "\n";
+                    }
                 }
             }
         }
@@ -36623,19 +39158,61 @@ namespace
             readGuestU32OrZero(rdram, object + 0x28u);
         const uint32_t fileState =
             readGuestU32OrZero(rdram, object + 0x34u);
+        // MOH_COMP_C0_GENERIC_CDB_PHASE_V1
+        //
+        // The C_c0 context starts after however many 0x80000-byte
+        // ART phases were required by this level:
+        //
+        //   phase 2 -> tag 0x201
+        //   phase 3 -> tag 0x302
+        //   phase 4 -> tag 0x403
+        //   phase N -> tag N * 0x101 - 1
+        //
+        // Do not assume that every level reaches C_c0 at phase 3.
+        const uint32_t compC0ObjectPhase =
+            readGuestU32OrZero(rdram, object + 0x30u);
+
+        const uint32_t compC0FilePhase =
+            fileObject != 0u
+                ? readGuestU32OrZero(
+                      rdram,
+                      fileObject + 0x00u)
+                : 0u;
+
+        const uint64_t compC0ExpectedTag64 =
+            compC0ObjectPhase != 0u
+                ? static_cast<uint64_t>(
+                      compC0ObjectPhase) *
+                      0x101ull -
+                      1ull
+                : 0ull;
+
+        const bool compC0PhaseExact =
+            compC0ObjectPhase != 0u &&
+            compC0ObjectPhase == compC0FilePhase &&
+            compC0ExpectedTag64 <= 0xFFFFFFFFull;
+
+        const uint32_t compC0ExpectedTag =
+            compC0PhaseExact
+                ? static_cast<uint32_t>(
+                      compC0ExpectedTag64)
+                : 0u;
+
         const bool compC0ObjectExact =
-            readGuestU32OrZero(rdram, object + 0x00u) == 0x302u &&
+            compC0PhaseExact &&
+            readGuestU32OrZero(rdram, object + 0x00u) ==
+                compC0ExpectedTag &&
             fileObject != 0u &&
             readGuestU32OrZero(rdram, object + 0x08u) == offset &&
             readGuestU32OrZero(rdram, object + 0x1Cu) == handle &&
             readGuestU32OrZero(rdram, object + 0x20u) == slot &&
             readGuestU32OrZero(rdram, object + 0x24u) == offset &&
             remaining != 0u &&
-            readGuestU32OrZero(rdram, object + 0x2Cu) == destination &&
-            readGuestU32OrZero(rdram, object + 0x30u) == 3u &&
+            readGuestU32OrZero(rdram, object + 0x2Cu) ==
+                destination &&
             fileState != 0u &&
-            readGuestU32OrZero(rdram, fileObject + 0x00u) == 3u &&
-            readGuestU32OrZero(rdram, fileObject + 0x04u) == fileState &&
+            readGuestU32OrZero(rdram, fileObject + 0x04u) ==
+                fileState &&
             operation == (offset == 0u ? 0x64u : 0x63u);
         const uint32_t chainedContextState =
             compC3CdbTransaction
@@ -36767,7 +39344,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -37273,6 +39850,33 @@ namespace
         const std::string path =
             readGuestStringLimited(rdram, slot + 0x0Cu, 128u);
 
+        // MOH_COMP_C0_GENERIC_ART_PHASES_V1
+        // The missed-finish handoff can happen at any 0x80000 phase boundary,
+        // not only at the phase-1 -> phase-2 transition observed in 6_1.
+        const uint32_t phaseIndex =
+            readGuestU32OrZero(rdram, object + 0x30u);
+        const uint64_t phaseBase64 =
+            phaseIndex >= 1u
+                ? static_cast<uint64_t>(phaseIndex - 1u) *
+                      0x80000ull
+                : 0x100000000ull;
+        const bool phaseBaseExact =
+            phaseIndex >= 2u &&
+            phaseBase64 <= 0xFFFFFFFFull &&
+            offset == static_cast<uint32_t>(phaseBase64);
+        const uint32_t expectedPhaseTag =
+            phaseBaseExact
+                ? phaseIndex * 0x101u - 1u
+                : 0u;
+        const uint32_t memberSizeForPhase =
+            readGuestU32OrZero(rdram, slot + 0x04u);
+        const uint32_t memberRemainingForPhase =
+            offset < memberSizeForPhase
+                ? memberSizeForPhase - offset
+                : 0u;
+        const uint32_t expectedFirstChunk =
+            std::min(memberRemainingForPhase, 0x8000u);
+
         const bool handleSequenceExact =
             finalDataHandle != 0u &&
             handle > finalDataHandle &&
@@ -37282,34 +39886,31 @@ namespace
             (handle & kMohFrontendAsyncTypeMask) ==
                 kMohFrontendAsyncTypeBits;
         const bool objectSequenceExact =
+            phaseBaseExact &&
+            expectedPhaseTag != 0u &&
             finalObject != 0u &&
             object != 0u &&
             object != finalObject &&
-            // A0's object header is cleared once A0 completes; by the time the
-            // loader parks at the frame-wait for A2 the +0x00/+0x04 words are 0
-            // (not the transient 0x100/->object state). Assert the cleared state
-            // instead. A2's own object (below) is fully validated and identifies
-            // the plateau precisely.
-            readGuestU32OrZero(rdram, finalObject + 0x00u) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x04u) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x1Cu) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x20u) == slot &&
-            readGuestU32OrZero(rdram, finalObject + 0x24u) == offset &&
-            readGuestU32OrZero(rdram, finalObject + 0x28u) == 0u &&
-            readGuestU32OrZero(rdram, finalObject + 0x2Cu) == destination &&
-            readGuestU32OrZero(rdram, object + 0x00u) == 0x201u &&
+            readGuestU32OrZero(rdram, object + 0x00u) ==
+                expectedPhaseTag &&
             fileObject != 0u &&
             readGuestU32OrZero(rdram, object + 0x08u) == 0u &&
             readGuestU32OrZero(rdram, object + 0x1Cu) == handle &&
             readGuestU32OrZero(rdram, object + 0x20u) == slot &&
             readGuestU32OrZero(rdram, object + 0x24u) == offset &&
             remaining != 0u &&
-            chunk == std::min(remaining, 0x8000u) &&
-            readGuestU32OrZero(rdram, object + 0x2Cu) == destination &&
-            readGuestU32OrZero(rdram, object + 0x30u) == 2u &&
+            static_cast<uint64_t>(remaining) == 0x80000ull &&
+            expectedFirstChunk != 0u &&
+            chunk == std::min(remaining, expectedFirstChunk) &&
+            readGuestU32OrZero(rdram, object + 0x2Cu) ==
+                destination &&
+            readGuestU32OrZero(rdram, object + 0x30u) ==
+                phaseIndex &&
             fileState != 0u &&
-            readGuestU32OrZero(rdram, fileObject + 0x00u) == 2u &&
-            readGuestU32OrZero(rdram, fileObject + 0x04u) == fileState;
+            readGuestU32OrZero(rdram, fileObject + 0x00u) ==
+                phaseIndex &&
+            readGuestU32OrZero(rdram, fileObject + 0x04u) ==
+                fileState;
         const bool entryExact =
             table != 0u &&
             entry != 0u &&
@@ -37345,7 +39946,7 @@ namespace
         std::error_code hostError;
         const bool hostResolved =
             resolveMohHostFilePath(
-                "cd:data\\6\\6_1\\comp.viv",
+                mohActiveLevelFile("comp.viv").c_str(),
                 hostPath) &&
             std::filesystem::is_regular_file(hostPath, hostError) &&
             !hostError;
@@ -37779,37 +40380,63 @@ namespace
             traceMohCompC1PhaseHandoffV1(rdram, ctx, runtime);
             traceMohCompC1Phase6WorkerV1(rdram, ctx, runtime);
             traceMohCompC1CdbPlateauV1(rdram, ctx, runtime);
+            bool genericCompProgress =
+                handoffMohAnyCompChunkQueuedReadV1(
+                    rdram,
+                    ctx,
+                    runtime);
             for (uint32_t wake = 0u; wake < 64u; ++wake)
             {
-                if (!wakeMohCompC1ReadWorkerV1(rdram, ctx, runtime))
+                if (!wakeMohAnyCompChunkReadWorkerV1(
+                        rdram,
+                        ctx,
+                        runtime))
                 {
                     break;
                 }
+                genericCompProgress = true;
             }
-            (void)handoffMohCompC1PhaseReturnV1(
-                rdram,
-                ctx,
-                runtime);
-            (void)handoffMohCompC2Phase9ReturnV1(
-                rdram,
-                ctx,
-                runtime);
-            (void)handoffMohCompC3PhaseDReturnV1(
-                rdram,
-                ctx,
-                runtime);
-            for (uint32_t wake = 0u; wake < 64u; ++wake)
+
+            // Keep the old phase-specific recovery as a conservative fallback.
+            // It is not entered when the generic path has already dispatched or
+            // signalled the exact current COMP.VIV transaction.
+            if (!genericCompProgress)
             {
-                if (!wakeMohCompC0ReadWorkerV1(rdram, ctx, runtime))
+                for (uint32_t wake = 0u; wake < 64u; ++wake)
                 {
-                    break;
+                    if (!wakeMohCompC1ReadWorkerV1(rdram, ctx, runtime))
+                    {
+                        break;
+                    }
                 }
-            }
-            for (uint32_t wake = 0u; wake < 64u; ++wake)
-            {
-                if (!wakeMohCompC0CdbReadWorkerV1(rdram, ctx, runtime))
+                (void)handoffMohCompC1PhaseReturnV1(
+                    rdram,
+                    ctx,
+                    runtime);
+                (void)handoffMohCompC2Phase9ReturnV1(
+                    rdram,
+                    ctx,
+                    runtime);
+                (void)handoffMohCompC3PhaseDReturnV1(
+                    rdram,
+                    ctx,
+                    runtime);
+                for (uint32_t wake = 0u; wake < 64u; ++wake)
                 {
-                    break;
+                    if (!wakeMohCompC0ReadWorkerV1(rdram, ctx, runtime))
+                    {
+                        break;
+                    }
+                }
+                for (uint32_t wake = 0u; wake < 64u; ++wake)
+                {
+                    if (!wakeMohCompC0CdbReadWorkerV1(
+                            rdram,
+                            ctx,
+                            runtime))
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -38056,6 +40683,52 @@ namespace
 
     void applyMohFrontlineCoreCompat(PS2Runtime &runtime)
     {
+        // Evaluate PS2_MOH_LEVEL at startup rather than on first use, so an
+        // invalid id is reported immediately instead of many seconds into the
+        // boot, and so the selection is visible in the log from the first line.
+        const uint32_t selected = mohSelectedLevelCode();
+
+        // With a level named and tracing on, resolve its assets at boot. This
+        // exercises the discovery and the numeric ordering of the LOAD banks for
+        // any level without having to reach it through the menu -- the only way
+        // to check that LOAD10 and LOAD11 sort after LOAD9 rather than after
+        // LOAD1, since the levels that ship them are deep in the campaign.
+        if (selected != 0u && mohTraceLevelLoad())
+        {
+            const MohLevelDescriptor lv = makeMohLevelDescriptor(selected);
+            mohTraceLevel("inventaire demarrage : %s (chapitre %s, prefixe %s, %s)",
+                          lv.id.c_str(), lv.chapter.c_str(), lv.prefix.c_str(),
+                          lv.directory.c_str());
+            std::filesystem::path p;
+            for (const char *leaf : {"comp.viv", "level.viv", "main.mus"})
+            {
+                const std::string guest = lv.directory + "/" + leaf;
+                const bool ok = resolveMohHostFilePath(guest, p);
+                mohTraceLevel("  %-9s %-7s %llu octets", leaf,
+                              ok ? "OK" : "ABSENT",
+                              (unsigned long long)mohHostFileSize(guest));
+            }
+            const std::vector<std::string> loads = mohDiscoverLoadBanks(lv);
+            std::string joined;
+            for (const std::string &b : loads)
+            {
+                joined += (joined.empty() ? "" : " ") + b;
+            }
+            mohTraceLevel("  LOAD*.ABK n=%zu : %s", loads.size(),
+                          joined.empty() ? "(aucune)" : joined.c_str());
+        }
+
+        // Registered only while tracing, so a normal run keeps the stock
+        // dispatch with no extra wrapper on the path.
+        if (mohTraceLevelLoad())
+        {
+            if (!g_mohOriginalSub109f48)
+            {
+                g_mohOriginalSub109f48 = runtime.lookupFunction(0x00109f48u);
+            }
+            runtime.registerFunction(0x00109f48u, &mohSub109f48LevelPathTrace);
+        }
+
         if (!g_mohOriginalSub1f2a68)
         {
             g_mohOriginalSub1f2a68 = runtime.lookupFunction(0x001f2a68u);
