@@ -32,7 +32,7 @@ recompiled game code driving a software Graphics Synthesizer.
 
 <table>
 <tr>
-<td width="50%"><img src="docs/images/01-ea-logo.png" alt="EA Games logo"></td>
+<td width="50%"><img src="docs/images/01-ea-logo.png" alt="Publisher logo"></td>
 <td width="50%"><img src="docs/images/02-title-screen.png" alt="Title screen"></td>
 </tr>
 <tr>
@@ -40,20 +40,42 @@ recompiled game code driving a software Graphics Synthesizer.
 <td><b>Title screen.</b> Textured plaque, alpha blending and the front-end font pipeline.</td>
 </tr>
 <tr>
+<td><img src="docs/images/07-intro-date.png" alt="June 6, 1944"></td>
+<td><img src="docs/images/08-intro-poem.png" alt="Intro poem"></td>
+</tr>
+<tr>
+<td colspan="2"><b>Intro sequence.</b> Documentary reel and title cards, in sync with the soundtrack.</td>
+</tr>
+<tr>
 <td><img src="docs/images/06-main-menu.png" alt="Main menu"></td>
-<td><img src="docs/images/03-mission-select.png" alt="Mission select"></td>
+<td><img src="docs/images/09-mission-dday.png" alt="Mission Log, D-Day"></td>
 </tr>
 <tr>
 <td><b>Main menu.</b> The campaign desk, with its map, compass and layered paper sprites.</td>
-<td><b>Mission Log.</b> Mission selection, save/load entries and the briefing portrait.</td>
+<td><b>Mission Log.</b> Mission detail, medal criteria and save/load entries.</td>
 </tr>
 <tr>
-<td><img src="docs/images/04-loading-screen.png" alt="Loading screen"></td>
-<td><img src="docs/images/05-intro-title-card.png" alt="Intro title card"></td>
+<td><img src="docs/images/11-enigma-cheat.png" alt="Enigma code entry"></td>
+<td><img src="docs/images/10-mission-all-unlocked.png" alt="All missions unlocked"></td>
 </tr>
 <tr>
-<td><b>Level load.</b> "Your Finest Hour" — mission title, artwork and a live progress bar.</td>
-<td><b>Intro sequence.</b> The documentary reel and its title cards, in sync with the soundtrack.</td>
+<td><b>Code entry.</b> The Enigma machine screen, here with the retail <code>DAWOIKS</code> cheat.</td>
+<td><b>…and it takes.</b> All six campaigns unlocked, so the whole mission tree is reachable.</td>
+</tr>
+<tr>
+<td><img src="docs/images/13-loading-rough-landing.png" alt="Rough Landing loading screen"></td>
+<td><img src="docs/images/12-loading-banner.png" alt="Loading banner"></td>
+</tr>
+<tr>
+<td><b>Level load.</b> "Rough Landing" — mission title, artwork and a live progress bar.</td>
+<td><b>Loading banner.</b> The between-screens transition.</td>
+</tr>
+<tr>
+<td colspan="2"><img src="docs/images/14-fleet-3d.png" alt="Normandy fleet, in engine"></td>
+</tr>
+<tr>
+<td colspan="2"><b>In engine.</b> The invasion fleet off Omaha Beach — recompiled game code driving a
+software Graphics Synthesizer. The banding across the water is the open defect below.</td>
 </tr>
 </table>
 
@@ -61,6 +83,7 @@ recompiled game code driving a software Graphics Synthesizer.
 
 - Cold boot through the publisher logos and the intro movie — video and audio.
 - Front-end: title screen, main menu, Mission Log, briefing screens, fonts, HUD sprites.
+- Code entry via the Enigma screen, including the retail level-unlock cheat.
 - Mission load, loading screens, and the first 3D scene with textures, fog and Z-buffering.
 - Streaming music and sound effects through the IOP HLE layer.
 - VU0 macro mode, VU1 microprogram interpretation, VIF1 unpack, GIF PATH1/2/3.
