@@ -40,11 +40,11 @@ recompiled game code driving a software Graphics Synthesizer.
 <td><b>Title screen.</b> Textured plaque, alpha blending and the front-end font pipeline.</td>
 </tr>
 <tr>
-<td><img src="docs/images/07-intro-date.png" alt="June 6, 1944"></td>
-<td><img src="docs/images/08-intro-poem.png" alt="Intro poem"></td>
+<td><img src="docs/images/07-level-open-date.png" alt="June 6, 1944"></td>
+<td><img src="docs/images/08-level-open-text.png" alt="Opening text"></td>
 </tr>
 <tr>
-<td colspan="2"><b>Intro sequence.</b> Documentary reel and title cards, in sync with the soundtrack.</td>
+<td colspan="2"><b>Level opening.</b> "Your Finest Hour" opens on its date card and text, over the soundtrack.</td>
 </tr>
 <tr>
 <td><img src="docs/images/06-main-menu.png" alt="Main menu"></td>
