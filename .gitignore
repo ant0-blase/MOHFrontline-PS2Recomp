@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Game data — never commit. The disc image and anything extracted from it is
+# copyrighted material; you must supply your own copy of the game.
+# ---------------------------------------------------------------------------
+iso/
+extracted/
+mc0/
+mc1/
+*.iso
+*.ISO
+*.img
+*.elf
+*.ELF
+*.sample
+*.pss
+*.sfn
+moh-runner-original-backup.bin
+
+# Recompiler output. Generated from the game's own ELF, so it is a derivative
+# of copyrighted code, and it is rebuilt locally by ps2xRecomp anyway.
+recomp/
+ps2xRuntime/output/
+ps2xRuntime/include/ps2_recompiled_functions.h
+ps2xRuntime/include/ps2_recompiled_stubs.h
+ps2xRuntime/src/runner/ps2_recompiled_functions.cpp
+ps2xRuntime/src/runner/register_functions.cpp
+
+# Third-party tooling installed locally (Ghidra, PCSX2, SDK documentation).
+tools/
+ps2-recomp-Agent-SKILL/
+
+# Build trees
+build/
+build-*/
+out/
+/bin/
+/intermediate/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.ilk
+*.exp
+*.pdb
+*.tlog
+*.ipch
+
+# Diagnostic captures. Instrumented runs produce multi-gigabyte logs.
+*.log
+moh-*.log
+logs/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*~
+*.swp
+.DS_Store
+
+# Local backups made before risky edits
+*.bak
+*.bak.*
+*.backup-*
+backups/
