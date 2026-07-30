@@ -418,6 +418,7 @@ static const std::unordered_map<std::string, std::string> gameDatabase =
     { "SLPM-65469", "Medal of Honor - Rising Sun (Japan)" },
     { "SLES-51876", "Medal of Honor - Rising Sun (Spain)" },
     { "SLUS-20753", "Medal of Honor - Rising Sun (USA)" },
+    { "SLUS-20368", "Medal of Honor - Frontline (USA)" },
     { "SLES-51874", "Medal of Honor - Soleil Levant (France)" },
     { "SLES-50903", "MegaRace 3 - Nanotech Disaster (Europe)" },
     { "SLPM-67535", "Memories Off (Korea) (Ja,Ko)" },

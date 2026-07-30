@@ -103,13 +103,13 @@ int main(int argc, char *argv[])
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
 
-        std::string windowTitle = "PS2-Recomp | ";
+        std::string windowTitle = "";
         const char *gameName = getGameName(normalizedId);
 
 #if !defined(PLATFORM_VITA)
         if (gameName)
         {
-            windowTitle += std::string(gameName) + " | " + elfName;
+            windowTitle += std::string(gameName);
         }
         else
 #endif
